@@ -21,15 +21,19 @@ const dbPath = path.join(dataDir, 'db.json')
 const frontendDistPath = path.join(__dirname, '..', '..', 'frontend', 'dist')
 const frontendIndexPath = path.join(frontendDistPath, 'index.html')
 
+function normalizeOrigin(origin) {
+  return origin.trim().replace(/\/$/, '')
+}
+
 function resolveAllowedOrigins() {
   const fromEnv = process.env.CORS_ORIGIN?.trim()
   if (!fromEnv) {
-    return DEFAULT_CORS_ORIGINS
+    return DEFAULT_CORS_ORIGINS.map(normalizeOrigin)
   }
 
   return fromEnv
     .split(',')
-    .map((origin) => origin.trim())
+    .map((origin) => normalizeOrigin(origin))
     .filter(Boolean)
 }
 
@@ -47,10 +51,11 @@ app.use(
         } catch {}
       }
 
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (!origin || allowedOrigins.includes(normalizeOrigin(origin))) {
         return callback(null, true)
       }
-      return callback(new Error('Not allowed by CORS'))
+
+      return callback(null, false)
     },
   })
 )
