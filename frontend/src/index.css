@@ -1,0 +1,40 @@
+:root {
+  --text: #1b2430;
+  --muted: #4f5b6a;
+  --bg: #f6f8fb;
+  --panel: #ffffff;
+  --bg-soft: #f9fbfd;
+  --border: #d7dee7;
+  --brand: #1f6feb;
+
+  font-family: Inter, Segoe UI, Roboto, Arial, sans-serif;
+  line-height: 1.45;
+  font-weight: 400;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+#root {
+  min-height: 100vh;
+}

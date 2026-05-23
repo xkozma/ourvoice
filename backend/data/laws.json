@@ -1,0 +1,62 @@
+[
+  {
+    "id": "law-1",
+    "title": "Urban Green Roof Incentive",
+    "summary": "Tax credits for apartment buildings that install and maintain green roofs.",
+    "status": "passed",
+    "category": "Environment",
+    "introducedOn": "2025-11-02",
+    "votedOn": "2026-01-14",
+    "governmentVote": {
+      "for": 112,
+      "against": 47,
+      "abstain": 9
+    },
+    "resultNote": "Passed and published in state bulletin. Program opens Q3 2026."
+  },
+  {
+    "id": "law-2",
+    "title": "Public Transport Late-Night Pilot",
+    "summary": "Weekend bus and tram services extended by 2 hours in major cities.",
+    "status": "passed",
+    "category": "Transport",
+    "introducedOn": "2025-09-18",
+    "votedOn": "2025-12-07",
+    "governmentVote": {
+      "for": 96,
+      "against": 58,
+      "abstain": 14
+    },
+    "resultNote": "Approved as a 12-month pilot with monthly performance reviews."
+  },
+  {
+    "id": "law-3",
+    "title": "Single-Use Plastic Ban in Open Markets",
+    "summary": "Gradual ban on disposable plastic packaging for open-air market vendors.",
+    "status": "rejected",
+    "category": "Environment",
+    "introducedOn": "2025-10-10",
+    "votedOn": "2026-02-03",
+    "governmentVote": {
+      "for": 62,
+      "against": 91,
+      "abstain": 15
+    },
+    "resultNote": "Rejected. Committee requested impact analysis for small vendors."
+  },
+  {
+    "id": "law-4",
+    "title": "Digital Literacy for Seniors",
+    "summary": "Free digital-skills workshops in local community centers for citizens 60+.",
+    "status": "in-progress",
+    "category": "Education",
+    "introducedOn": "2026-03-01",
+    "votedOn": null,
+    "governmentVote": {
+      "for": 0,
+      "against": 0,
+      "abstain": 0
+    },
+    "resultNote": "Under committee review. Final vote expected in summer session."
+  }
+]
