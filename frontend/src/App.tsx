@@ -42,7 +42,8 @@ type Law = {
   }
 }
 
-const API_BASE = import.meta.env.VITE_API_URL || '/api'
+const rawApiBase = (import.meta.env.VITE_API_URL || '/api').trim().replace(/\/$/, '')
+const API_BASE = rawApiBase.endsWith('/api') ? rawApiBase : `${rawApiBase}/api`
 const GOVERNMENT_CHART_COLORS = ['#1f6feb', '#d1242f', '#7f8ea3']
 const CITIZEN_CHART_COLORS = ['#1d7a34', '#d1242f']
 const USEFULNESS_CHART_COLORS = ['#0f8a7a', '#9c6a11']
@@ -111,7 +112,8 @@ function App() {
   }, [laws])
 
   async function request<T>(path: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(`${API_BASE}${path}`, {
+    const url = `${API_BASE}${path}`
+    const response = await fetch(url, {
       ...options,
       headers: {
         'Content-Type': 'application/json',
@@ -120,9 +122,19 @@ function App() {
       },
     })
 
+    const contentType = response.headers.get('content-type') || ''
+    const isJson = contentType.includes('application/json')
+
     if (!response.ok) {
-      const payload = await response.json().catch(() => ({}))
+      const payload = isJson ? await response.json().catch(() => ({})) : {}
       throw new Error(payload.message || 'Request failed.')
+    }
+
+    if (!isJson) {
+      const bodyText = await response.text()
+      throw new Error(
+        `API returned non-JSON from ${url}. Check VITE_API_URL. Response starts with: ${bodyText.slice(0, 80)}`
+      )
     }
 
     return response.json()
