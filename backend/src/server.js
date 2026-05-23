@@ -272,7 +272,15 @@ app.post('/api/laws/:lawId/comments', authRequired, (req, res) => {
 if (fs.existsSync(frontendIndexPath)) {
   app.use(express.static(frontendDistPath))
 
-  app.get(/^\/(?!api).*/, (_req, res) => {
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) {
+      return next()
+    }
+
+    if (path.extname(req.path)) {
+      return next()
+    }
+
     res.sendFile(frontendIndexPath)
   })
 }
