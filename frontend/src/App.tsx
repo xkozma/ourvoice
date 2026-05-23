@@ -42,7 +42,7 @@ type Law = {
   }
 }
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:4000/api'
+const API_BASE = import.meta.env.VITE_API_URL || '/api'
 const GOVERNMENT_CHART_COLORS = ['#1f6feb', '#d1242f', '#7f8ea3']
 const CITIZEN_CHART_COLORS = ['#1d7a34', '#d1242f']
 const USEFULNESS_CHART_COLORS = ['#0f8a7a', '#9c6a11']

@@ -10,14 +10,50 @@ import { fileURLToPath } from 'node:url'
 const app = express()
 const PORT = process.env.PORT || 4000
 const JWT_SECRET = process.env.JWT_SECRET || 'ourvoice-dev-secret'
+const DEFAULT_CORS_ORIGINS = ['http://localhost:5173']
+const hasExplicitCorsOrigins = Boolean(process.env.CORS_ORIGIN?.trim())
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const dataDir = path.join(__dirname, '..', 'data')
 const lawsPath = path.join(dataDir, 'laws.json')
 const dbPath = path.join(dataDir, 'db.json')
+const frontendDistPath = path.join(__dirname, '..', '..', 'frontend', 'dist')
+const frontendIndexPath = path.join(frontendDistPath, 'index.html')
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:5173' }))
+function resolveAllowedOrigins() {
+  const fromEnv = process.env.CORS_ORIGIN?.trim()
+  if (!fromEnv) {
+    return DEFAULT_CORS_ORIGINS
+  }
+
+  return fromEnv
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+}
+
+const allowedOrigins = resolveAllowedOrigins()
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!hasExplicitCorsOrigins && origin) {
+        try {
+          const parsedOrigin = new URL(origin)
+          if (['localhost', '127.0.0.1'].includes(parsedOrigin.hostname)) {
+            return callback(null, true)
+          }
+        } catch {}
+      }
+
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true)
+      }
+      return callback(new Error('Not allowed by CORS'))
+    },
+  })
+)
 app.use(express.json())
 
 function readJson(filePath) {
@@ -232,6 +268,14 @@ app.post('/api/laws/:lawId/comments', authRequired, (req, res) => {
   writeDb(db)
   res.status(201).json({ citizen: summarizeLawFeedback(feedback) })
 })
+
+if (fs.existsSync(frontendIndexPath)) {
+  app.use(express.static(frontendDistPath))
+
+  app.get(/^\/(?!api).*/, (_req, res) => {
+    res.sendFile(frontendIndexPath)
+  })
+}
 
 app.listen(PORT, () => {
   console.log(`OurVoice backend running on http://localhost:${PORT}`)
