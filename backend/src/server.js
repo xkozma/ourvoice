@@ -22,6 +22,7 @@ const __dirname = path.dirname(__filename)
 const dataDir = path.join(__dirname, '..', 'data')
 const lawsPath = path.join(dataDir, 'laws.json')
 const DB_PATH = path.join(dataDir, 'db.json')
+const EXPLANATIONS_PATH = path.join(dataDir, 'law-explanations.json')
 const frontendDistPath = path.join(__dirname, '..', '..', 'frontend', 'dist')
 const frontendIndexPath = path.join(frontendDistPath, 'index.html')
 
@@ -29,10 +30,26 @@ function ensureDbFile() {
   if (!fs.existsSync(DB_PATH)) {
     fs.writeFileSync(
       DB_PATH,
-      JSON.stringify({ users: [], lawFeedback: {} }, null, 2),
+      JSON.stringify({ users: [], lawFeedback: {}, lawExplanations: {} }, null, 2),
       'utf8'
     )
   }
+}
+
+function ensureExplanationsFile() {
+  if (!fs.existsSync(EXPLANATIONS_PATH)) {
+    fs.writeFileSync(EXPLANATIONS_PATH, JSON.stringify({}, null, 2), 'utf8')
+  }
+}
+
+function readExplanations() {
+  ensureExplanationsFile()
+  return JSON.parse(fs.readFileSync(EXPLANATIONS_PATH, 'utf8'))
+}
+
+function writeExplanations(obj) {
+  ensureExplanationsFile()
+  fs.writeFileSync(EXPLANATIONS_PATH, JSON.stringify(obj, null, 2), 'utf8')
 }
 
 const NRSR_VOTING_URL = 'https://www.nrsr.sk/web/default.aspx?SectionId=108'
@@ -43,7 +60,29 @@ const NRSR_HEADERS = {
 }
 
 function stripHtml(text) {
-  return String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+  return extractTextFromHtml(text)
+}
+
+function extractTextFromHtml(html) {
+  // First try to just get content between tags, removing scripts/styles first
+  let cleaned = html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+  
+  // Get all text nodes by removing tags but keeping text
+  let text = cleaned
+    .replace(/<[^>]+>/g, ' ')  // Remove all HTML tags
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&.*?;/g, ' ')  // Cleanup remaining HTML entities
+    .replace(/\s+/g, ' ')    // Collapse multiple spaces
+    .trim()
+  
+  return text
 }
 
 function parseNrDate(dateString) {
@@ -341,9 +380,190 @@ function lawState(db, lawId) {
     db.lawFeedback[lawId] = {
       citizenVotes: {},
       usefulnessVotes: {},
+      comments: [],
     }
   }
   return db.lawFeedback[lawId]
+}
+
+async function fetchDocumentTextFromUrl(url) {
+  try {
+    if (!url) return null
+    const res = await fetch(url, { headers: NRSR_HEADERS })
+    if (!res.ok) return null
+
+    const contentType = res.headers.get('content-type') || ''
+    const text = await res.text()
+
+    // If it's HTML, try to locate a DocumentPreview link (DocID)
+    if (contentType.includes('text/html')) {
+      const $ = loadCheerio(text)
+
+// Prefer explicit DocumentPreview links - try a few consecutive DocIDs since the first may be a cover image
+      const previewAnchor = $('a[href*="DocumentPreview.aspx?DocID="]').first()
+      if (previewAnchor.length) {
+        const href = previewAnchor.attr('href')
+        const baseHref = makeAbsoluteNrsrUrl(href) || href
+        const docIdMatch = baseHref.match(/DocID=(\d+)/)
+        const docIds = docIdMatch
+          ? [0, 1, 2, 3].map((offset) => String(parseInt(docIdMatch[1], 10) + offset))
+          : []
+        
+        for (const docId of docIds) {
+          const previewUrl = docIdMatch ? baseHref.replace(/DocID=\d+/, `DocID=${docId}`) : baseHref
+          try {
+            const p = await fetch(previewUrl, { headers: NRSR_HEADERS })
+            if (!p.ok) continue
+            const body = await p.text()
+            // NRSR document renderer uses awspan class elements for all text
+            if (body.includes('awspan')) {
+              const awSpanMatches = body.match(/class="awspan[^"]*"[^>]*>([^<]+)</g) || []
+              if (awSpanMatches.length > 10) {
+                const extracted = awSpanMatches
+                  .map(m => {
+                    const match = m.match(/class="awspan[^"]*"[^>]*>([^<]+)</)  
+                    return match ? match[1] : ''
+                  })
+                  .filter(Boolean)
+                  .join(' ')
+                  .replace(/\s+/g, ' ')
+                  .trim()
+                if (extracted.length > 100) {
+                  return extracted
+                }
+              }
+            }
+            // Fallback: raw HTML extraction
+            const extracted = extractTextFromHtml(body)
+            if (extracted.length > 100) {
+              return extracted
+            }
+          } catch (err) {
+            // continue to next DocID
+          }
+        }
+      }
+
+      // Otherwise, try to find a link with text containing Návrh or Navrh
+      const navrh = $('a').filter((i, el) => /navrh|návrh/i.test($(el).text())).first()
+      if (navrh.length) {
+        const href = navrh.attr('href')
+        const abs = makeAbsoluteNrsrUrl(href) || href
+        try {
+          const p = await fetch(abs, { headers: NRSR_HEADERS })
+          if (p.ok) {
+            const body = await p.text()
+            const extracted = extractTextFromHtml(body)
+            if (extracted.length > 100) {
+              return extracted
+            }
+          }
+        } catch (err) {
+          // ignore
+        }
+      }
+
+      // Fall back to body text from cheerio
+      const bodyText = $('body').text()
+      if (bodyText && bodyText.length > 50) {
+        return extractTextFromHtml(bodyText)
+      }
+      
+      // Ultimate fallback: raw HTML extraction
+      return extractTextFromHtml(text)
+    }
+
+    // Non-HTML fallback: use raw text extraction
+    return extractTextFromHtml(text)
+  } catch (error) {
+    console.error('fetchDocumentTextFromUrl error:', error.message)
+    return null
+  }
+}
+
+async function callGoogleGenerative(prompt) {
+  const apiKey = process.env.GOOGLE_API_KEY || process.env.GENERATIVE_API_KEY
+  if (!apiKey) throw new Error('Missing Google API key')
+
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent'
+
+  const body = {
+    contents: [
+      {
+        parts: [
+          {
+            text: prompt,
+          },
+        ],
+      },
+    ],
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-goog-api-key': apiKey,
+    },
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    const txt = await res.text()
+    throw new Error(`Google API error: ${res.status} ${txt}`)
+  }
+
+  const json = await res.json()
+
+  // Parse the Google Generative API response (v1beta: candidates[0].content.parts[0].text)
+  if (Array.isArray(json.candidates) && json.candidates.length > 0) {
+    const candidate = json.candidates[0]
+    if (candidate.content && candidate.content.parts && Array.isArray(candidate.content.parts)) {
+      for (const part of candidate.content.parts) {
+        if (part.text) {
+          return part.text.trim()
+        }
+      }
+    }
+  }
+
+  return JSON.stringify(json).slice(0, 2000)
+}
+
+async function generateExplanationForLaw(law) {
+  try {
+    const explanations = readExplanations()
+    if (explanations[law.id]) return explanations[law.id]
+
+    let docText = null
+    const docUrl = law.documentsUrl || law.sourceUrl || null
+    
+    if (docUrl && !docUrl.includes('nrsr.sk/web/default.aspx')) {
+      docText = await fetchDocumentTextFromUrl(docUrl)
+    }
+
+    // If no doc text from URL, generate from summary/title directly
+    if (!docText || docText.length < 100) {
+      docText = `Title: ${law.title}\nSummary: ${law.summary || law.title}\nStatus: ${law.status || ''}\nCategory: ${law.category || ''}`
+    }
+
+    const prompt = `Summarize the following law proposal in at most 3 sentences. Include at least one sentence describing how this will directly affect ordinary citizens in their daily life. Be concise and plain.\n\nLaw:\n${docText.slice(0, 3000)}`
+
+    const aiText = await callGoogleGenerative(prompt)
+
+    const entry = {
+      text: aiText,
+      sourceUrl: docUrl,
+      generatedAt: new Date().toISOString(),
+    }
+
+    explanations[law.id] = entry
+    writeExplanations(explanations)
+    return entry
+  } catch (error) {
+    console.error('generateExplanationForLaw error:', error.message)
+    return null
+  }
 }
 
 function summarizeLawFeedback(feedback) {
@@ -462,18 +682,40 @@ app.get('/api/laws', async (_req, res) => {
     const laws = await loadActiveLaws()
 
     const db = await readDb()
+    const explanations = readExplanations()
 
     const items = laws.map((law) => {
       const feedback = lawState(db, law.id)
       const summary = summarizeLawFeedback(feedback)
+      const explanationEntry = explanations[law.id]
 
       return {
         ...law,
         citizen: summary,
+        aiExplanation: explanationEntry ? explanationEntry.text : null,
       }
     })
 
+    // Persist any initial DB changes (e.g. lawFeedback initialization)
     await writeDb(db)
+
+    // Trigger background generation for laws missing explanations
+    if (process.env.GOOGLE_API_KEY || process.env.GENERATIVE_API_KEY) {
+      ;(async () => {
+        try {
+          for (const law of laws) {
+            const current = readExplanations()
+            if (!current[law.id]) {
+              // generate but don't block the response
+              await generateExplanationForLaw(law)
+            }
+          }
+        } catch (err) {
+          console.error('background explanation generation error:', err.message)
+        }
+      })()
+    }
+
     res.json({ items })
   } catch (error) {
     console.error('laws error:', error.message)
@@ -529,6 +771,24 @@ app.post('/api/laws/:lawId/usefulness', authRequired, async (req, res) => {
     res.json({ citizen: summarizeLawFeedback(feedback) })
   } catch (error) {
     console.error('usefulness error:', error.message)
+    res.status(500).json({ message: error.message })
+  }
+})
+
+// Trigger generation of AI explanation for a single law (can be used to debug/generate on-demand)
+app.post('/api/laws/:lawId/generate-explanation', async (req, res) => {
+  try {
+    const { lawId } = req.params
+    const laws = await loadActiveLaws()
+    const law = laws.find((l) => l.id === lawId)
+    if (!law) return res.status(404).json({ message: 'Law not found.' })
+
+    const entry = await generateExplanationForLaw(law)
+    if (!entry) return res.status(500).json({ message: 'Failed to generate explanation.' })
+
+    res.json({ explanation: entry })
+  } catch (error) {
+    console.error('generate-explanation error:', error.message)
     res.status(500).json({ message: error.message })
   }
 })

@@ -36,6 +36,7 @@ type Law = {
       useless: number
     }
   }
+  aiExplanation?: string | null
 }
 
 const rawApiBase = (import.meta.env.VITE_API_URL || '/api').trim().replace(/\/$/, '')
@@ -401,6 +402,14 @@ function App() {
                   />
                 </div>
 
+                <div className="ai-explanation">
+                  <h5>AI explanation</h5>
+                  {law.aiExplanation ? (
+                    <p className="ai-text">{law.aiExplanation}</p>
+                  ) : (
+                    <p className="ai-pending">Not available yet — generating a short summary.</p>
+                  )}
+                </div>
                 {user ? (
                   <div className="action-row">
                     <button type="button" onClick={() => submitCitizenVote(law.id, 'support')}>
@@ -446,6 +455,14 @@ function App() {
               </button>
             </header>
             <p>{selectedLaw.summary}</p>
+            <section className="modal-ai">
+              <h4>AI explanation</h4>
+              {selectedLaw.aiExplanation ? (
+                <p>{selectedLaw.aiExplanation}</p>
+              ) : (
+                <p className="ai-pending">Explanation not available yet. It may take a moment.</p>
+              )}
+            </section>
           </section>
         </div>
       )}
