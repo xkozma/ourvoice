@@ -23,6 +23,9 @@ type Law = {
     abstain: number
   }
   resultNote: string
+  votingUrl?: string | null
+  cpt?: string | null
+  documentsUrl?: string | null
   citizen: {
     citizenVotes: {
       support: number
@@ -32,13 +35,6 @@ type Law = {
       useful: number
       useless: number
     }
-    comments: Array<{
-      id: string
-      userId: string
-      userName: string
-      text: string
-      createdAt: string
-    }>
   }
 }
 
@@ -89,6 +85,7 @@ function SplitDonutChart({
 
 function App() {
   const [laws, setLaws] = useState<Law[]>([])
+  const [selectedLaw, setSelectedLaw] = useState<Law | null>(null)
   const [token, setToken] = useState<string | null>(localStorage.getItem('ourvoice_token'))
   const [user, setUser] = useState<User | null>(() => {
     const stored = localStorage.getItem('ourvoice_user')
@@ -101,13 +98,17 @@ function App() {
   const [authError, setAuthError] = useState('')
   const [isAuthLoading, setIsAuthLoading] = useState(false)
   const [globalError, setGlobalError] = useState('')
-  const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({})
 
   const sortedLaws = useMemo(() => {
     return [...laws].sort((a, b) => {
-      const dateA = a.votedOn ?? a.introducedOn
-      const dateB = b.votedOn ?? b.introducedOn
-      return dateA < dateB ? 1 : -1
+      const dateA = new Date(a.votedOn ?? a.introducedOn).valueOf() || 0
+      const dateB = new Date(b.votedOn ?? b.introducedOn).valueOf() || 0
+      if (dateA !== dateB) {
+        return dateB - dateA
+      }
+      const cptA = Number.parseInt(String(a.cpt || '0'), 10) || 0
+      const cptB = Number.parseInt(String(b.cpt || '0'), 10) || 0
+      return cptB - cptA
     })
   }, [laws])
 
@@ -212,27 +213,6 @@ function App() {
     }
   }
 
-  async function submitComment(lawId: string) {
-    const text = commentDrafts[lawId]?.trim()
-    if (!text) return
-
-    try {
-      await request(`/laws/${lawId}/comments`, {
-        method: 'POST',
-        body: JSON.stringify({ text }),
-      })
-
-      setCommentDrafts((current) => ({
-        ...current,
-        [lawId]: '',
-      }))
-
-      await loadLaws()
-    } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : 'Failed to save comment.')
-    }
-  }
-
   return (
     <main className="page">
       <header className="topbar">
@@ -249,7 +229,7 @@ function App() {
               </button>
             </>
           ) : (
-            <span>Sign in to vote and comment</span>
+            <span>Sign in to vote</span>
           )}
         </div>
       </header>
@@ -339,11 +319,25 @@ function App() {
             <header className="law-header">
               <div>
                 <h3>{law.title}</h3>
-                <p>{law.summary}</p>
+                <p className="law-summary-clamped">{law.summary}</p>
+                <button className="ghost" type="button" onClick={() => setSelectedLaw(law)}>
+                  Read full text
+                </button>
               </div>
               <div className="meta">
                 <span className={`status status-${law.status}`}>{law.status}</span>
                 <span>{law.category}</span>
+                {law.cpt && <span>ČPT: {law.cpt}</span>}
+                {law.documentsUrl && (
+                  <a href={law.documentsUrl} target="_blank" rel="noreferrer">
+                    Documents
+                  </a>
+                )}
+                {law.votingUrl && (
+                  <a href={law.votingUrl} target="_blank" rel="noreferrer">
+                    Voting detail
+                  </a>
+                )}
               </div>
             </header>
 
@@ -431,48 +425,30 @@ function App() {
               </section>
             </div>
 
-            <section className="comments">
-              <h4>Citizen comments</h4>
-
-              {user && (
-                <div className="comment-input-row">
-                  <textarea
-                    value={commentDrafts[law.id] ?? ''}
-                    onChange={(event) =>
-                      setCommentDrafts((current) => ({
-                        ...current,
-                        [law.id]: event.target.value,
-                      }))
-                    }
-                    rows={3}
-                    placeholder="Share your perspective on this law..."
-                  />
-                  <button type="button" onClick={() => submitComment(law.id)}>
-                    Add comment
-                  </button>
-                </div>
-              )}
-
-              {law.citizen.comments.length === 0 ? (
-                <p className="helper">No comments yet.</p>
-              ) : (
-                <ul className="comment-list">
-                  {law.citizen.comments.slice(0, 8).map((comment) => (
-                    <li key={comment.id}>
-                      <div>
-                        <strong>{comment.userName}</strong>
-                        <span>{new Date(comment.createdAt).toLocaleString()}</span>
-                      </div>
-                      <p>{comment.text}</p>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </section>
           </article>
           )
         })}
       </section>
+
+      {selectedLaw && (
+        <div className="modal-backdrop" onClick={() => setSelectedLaw(null)} role="presentation">
+          <section
+            className="law-modal"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Law full description"
+          >
+            <header className="law-modal-header">
+              <h3>{selectedLaw.title}</h3>
+              <button type="button" className="ghost" onClick={() => setSelectedLaw(null)}>
+                Close
+              </button>
+            </header>
+            <p>{selectedLaw.summary}</p>
+          </section>
+        </div>
+      )}
     </main>
   )
 }

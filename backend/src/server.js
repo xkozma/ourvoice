@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
+import { load as loadCheerio } from 'cheerio'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
@@ -16,31 +17,270 @@ const JWT_SECRET = process.env.JWT_SECRET || 'ourvoice-dev-secret'
 const DEFAULT_CORS_ORIGINS = ['http://localhost:5173']
 const hasExplicitCorsOrigins = Boolean(process.env.CORS_ORIGIN?.trim())
 
-const JSONBIN_BIN_ID = process.env.JSONBIN_BIN_ID
-const JSONBIN_API_KEY = process.env.JSONBIN_API_KEY
-
-if (!JSONBIN_BIN_ID || !JSONBIN_API_KEY) {
-  console.warn(
-    'Warning: JSONBIN_BIN_ID or JSONBIN_API_KEY not set. Database reads/writes will fail.'
-  )
-} else {
-  console.log(
-    `jsonbin configured — bin: ${JSONBIN_BIN_ID} | key: ${JSONBIN_API_KEY.slice(0, 8)}...${JSONBIN_API_KEY.slice(-4)}`
-  )
-}
-
-const JSONBIN_BASE = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`
-const JSONBIN_HEADERS = {
-  'Content-Type': 'application/json',
-  'X-Master-Key': JSONBIN_API_KEY,
-}
-
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const dataDir = path.join(__dirname, '..', 'data')
 const lawsPath = path.join(dataDir, 'laws.json')
+const DB_PATH = path.join(dataDir, 'db.json')
 const frontendDistPath = path.join(__dirname, '..', '..', 'frontend', 'dist')
 const frontendIndexPath = path.join(frontendDistPath, 'index.html')
+
+function ensureDbFile() {
+  if (!fs.existsSync(DB_PATH)) {
+    fs.writeFileSync(
+      DB_PATH,
+      JSON.stringify({ users: [], lawFeedback: {} }, null, 2),
+      'utf8'
+    )
+  }
+}
+
+const NRSR_VOTING_URL = 'https://www.nrsr.sk/web/default.aspx?SectionId=108'
+const NRSR_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+  Accept: 'text/html,application/xhtml+xml,application/xml,*/*',
+  Referer: 'https://www.nrsr.sk/web/',
+}
+
+function stripHtml(text) {
+  return String(text).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+function parseNrDate(dateString) {
+  // Parse dates like "7.5.2026" or "7.5.2026 11:30:40"
+  const match = String(dateString).match(/(\d+)\.(\d+)\.(\d{4})/)
+  if (!match) return null
+  const [, day, month, year] = match
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+function parseNrTimestamp(dateString) {
+  const match = String(dateString).match(
+    /(\d+)\.(\d+)\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/
+  )
+  if (!match) {
+    return { date: null, iso: null, timestamp: 0 }
+  }
+
+  const [, day, month, year, hour = '00', minute = '00', second = '00'] = match
+  const iso = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}`
+  const parsed = new Date(iso)
+
+  return {
+    date: iso.slice(0, 10),
+    iso,
+    timestamp: Number.isNaN(parsed.valueOf()) ? 0 : parsed.valueOf(),
+  }
+}
+
+function makeAbsoluteNrsrUrl(href) {
+  const value = String(href || '').trim()
+  if (!value) return null
+  try {
+    return new URL(value, 'https://www.nrsr.sk').toString()
+  } catch {
+    return null
+  }
+}
+
+function createBillId(billNumber, title) {
+  const raw = `nrsr-${String(billNumber || title || 'bill').trim()}`
+  const normalized = raw
+    .replace(/[^a-zA-Z0-9-]/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64)
+  return normalized
+}
+
+function inferCategory(text) {
+  const lower = String(text).toLowerCase()
+  if (/zdrav|nemocn|lekár|ošetrov|zdravie/.test(lower)) return 'Health'
+  if (/doprava|cest|autobus|vlak|dráha|most|cesta/.test(lower)) return 'Transport'
+  if (/škola|vzdel|študent|uciteľ|senior|mlad/.test(lower)) return 'Education'
+  if (/klíma|eko|odpad|zelen|životné prostredie/.test(lower)) return 'Environment'
+  if (/obec|samop|kraj|mesto|živnost|region/.test(lower)) return 'Local government'
+  return 'Public policy'
+}
+
+function inferStatus(text) {
+  const lower = String(text).toLowerCase()
+  if (/zamietla|zamietnutá|zamietnutý|zamietol/.test(lower)) return 'rejected'
+  if (/schválila|schválený|schváli|schválené|schválené/.test(lower)) return 'passed'
+  return 'in-progress'
+}
+
+async function fetchVotingDetails(votingUrl) {
+  try {
+    if (!votingUrl) {
+      return { for: 0, against: 0, abstain: 0, status: 'in-progress', votedOn: null }
+    }
+
+    const response = await fetch(votingUrl, { headers: NRSR_HEADERS })
+    if (!response.ok) {
+      return { for: 0, against: 0, abstain: 0, status: 'in-progress', votedOn: null }
+    }
+
+    const html = await response.text()
+    const $ = loadCheerio(html)
+    const normalized = $('body').text().replace(/\s+/g, ' ')
+
+    const forMatch = normalized.match(/Za\s+hlasovalo\s*(\d+)/i)
+    const againstMatch = normalized.match(/Proti\s+hlasovalo\s*(\d+)/i)
+    const abstainMatch = normalized.match(/Zdržalo\s+sa\s+hlasovania\s*(\d+)/i)
+
+    const votedOnMatch = normalized.match(/Dátum\s+a\s+čas\s*(\d+\.\s*\d+\.\s*\d{4}\s+\d{1,2}:\d{2})/i)
+    const votedOn = votedOnMatch ? parseNrTimestamp(votedOnMatch[1]).date : null
+
+    let status = 'in-progress'
+    if (/Výsledok\s+hlasovania\s*Návrh\s+prešiel/i.test(normalized)) {
+      status = 'passed'
+    } else if (/Výsledok\s+hlasovania\s*Návrh\s+neprešiel/i.test(normalized)) {
+      status = 'rejected'
+    }
+
+    return {
+      for: forMatch ? parseInt(forMatch[1], 10) : 0,
+      against: againstMatch ? parseInt(againstMatch[1], 10) : 0,
+      abstain: abstainMatch ? parseInt(abstainMatch[1], 10) : 0,
+      status,
+      votedOn,
+    }
+  } catch (error) {
+    console.error('fetch voting details error:', error.message)
+    return { for: 0, against: 0, abstain: 0, status: 'in-progress', votedOn: null }
+  }
+}
+
+function mapBillToLaw(bill) {
+  const title = String(bill.title ?? '').trim()
+  const summary = String(bill.description ?? title).trim()
+  const billId = String(bill.billNumber ?? '')
+
+  return {
+    id: createBillId(billId, title),
+    title,
+    summary,
+    status: bill.status || inferStatus(`${title} ${summary}`),
+    category: inferCategory(`${title} ${summary}`),
+    introducedOn: bill.date,
+    votedOn: bill.votedOn || null,
+    governmentVote: bill.governmentVote || {
+      for: 0,
+      against: 0,
+      abstain: 0,
+    },
+    resultNote: summary,
+    sourceUrl: bill.sourceUrl || NRSR_VOTING_URL,
+    votingUrl: bill.votingUrl || null,
+    cpt: bill.billNumber || null,
+    documentsUrl: bill.documentsUrl || null,
+  }
+}
+
+async function loadNRSRLaws() {
+  try {
+    const response = await fetch(NRSR_VOTING_URL, {
+      headers: NRSR_HEADERS,
+    })
+
+    if (!response.ok) {
+      throw new Error(`NRSR fetch failed (${response.status})`)
+    }
+
+    const html = await response.text()
+    const $ = loadCheerio(html)
+
+    const bills = []
+
+    $('table tr').each((index, element) => {
+      const cells = $(element).find('td')
+      if (cells.length < 6) return
+
+      const sessionNum = $(cells[0]).text().trim()
+      const dateStr = $(cells[1]).text().trim()
+      const votingNum = $(cells[2]).text().trim()
+      const billNum = $(cells[3]).text().trim()
+      const titleText = stripHtml($(cells[4]).text())
+      const voteHref = $(cells[5]).find('a').first().attr('href') || ''
+      const cptHref = $(cells[3]).find('a').first().attr('href') || ''
+
+      if (!titleText || !dateStr) return
+
+      const billIdMatch = titleText.match(/\(tlač\s*(\d+)\)/)
+      const billId = billIdMatch ? billIdMatch[1] : billNum
+      const time = parseNrTimestamp(dateStr)
+      const voteNumber = Number.parseInt(votingNum, 10)
+
+      // Keep only rows with ČPT (law proposals / materials), skip procedural-only rows.
+      if (!billId) return
+
+      bills.push({
+        sessionNumber: sessionNum,
+        date: time.date || parseNrDate(dateStr),
+        timestamp: time.timestamp,
+        voteNumber: Number.isNaN(voteNumber) ? 0 : voteNumber,
+        votingNumber: votingNum,
+        billNumber: billId,
+        title: titleText,
+        description: titleText,
+        sourceUrl: NRSR_VOTING_URL,
+        votingUrl: makeAbsoluteNrsrUrl(voteHref),
+        documentsUrl:
+          makeAbsoluteNrsrUrl(cptHref) ||
+          `https://www.nrsr.sk/web/?SectionId=91&CisloTlace=${encodeURIComponent(String(billId))}`,
+        governmentVote: { for: 0, against: 0, abstain: 0 },
+        status: 'in-progress',
+        votedOn: null,
+      })
+    })
+
+    const latest = bills
+      .sort((a, b) => b.timestamp - a.timestamp || b.voteNumber - a.voteNumber)
+      .slice(0, 10)
+
+    const withVotes = await Promise.all(
+      latest.map(async (bill) => {
+        const voting = await fetchVotingDetails(bill.votingUrl)
+        return {
+          ...bill,
+          votedOn: voting.votedOn,
+          status: voting.status,
+          governmentVote: {
+            for: voting.for,
+            against: voting.against,
+            abstain: voting.abstain,
+          },
+        }
+      })
+    )
+
+    return withVotes.map(mapBillToLaw)
+  } catch (error) {
+    console.error('NRSR fetch error:', error.message)
+    return []
+  }
+}
+
+let activeLawsCache = { items: [], expiresAt: 0 }
+
+async function loadActiveLaws() {
+  const now = Date.now()
+  if (activeLawsCache.expiresAt > now && activeLawsCache.items.length) {
+    return activeLawsCache.items
+  }
+
+  let laws = await loadNRSRLaws()
+  if (!laws.length) {
+    laws = readJson(lawsPath).slice(0, 10)
+  }
+
+  activeLawsCache = {
+    items: laws,
+    expiresAt: now + 5 * 60 * 1000,
+  }
+
+  return laws
+}
 
 function normalizeOrigin(origin) {
   return origin.trim().replace(/\/$/, '')
@@ -86,32 +326,14 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'))
 }
 
-async function jsonbinRequest(url, options = {}) {
-  console.log(`[jsonbin] ${options.method ?? 'GET'} ${url}`)
-  console.log(`[jsonbin] X-Master-Key starts with: ${JSONBIN_API_KEY?.slice(0, 12) ?? '(not set)'}`)
-  const response = await fetch(url, { ...options, headers: { ...JSONBIN_HEADERS, ...options.headers } })
-  const text = await response.text()
-  console.log(`[jsonbin] status: ${response.status} | body[:300]: ${text.slice(0, 300)}`)
-  if (!response.ok) {
-    throw new Error(`jsonbin ${options.method ?? 'GET'} failed (${response.status}): ${text.slice(0, 300)}`)
-  }
-  try {
-    return JSON.parse(text)
-  } catch {
-    throw new Error(`jsonbin returned non-JSON (status ${response.status}): ${text.slice(0, 300)}`)
-  }
-}
-
 async function readDb() {
-  const payload = await jsonbinRequest(`${JSONBIN_BASE}/latest`)
-  return payload.record
+  ensureDbFile()
+  return readJson(DB_PATH)
 }
 
 async function writeDb(db) {
-  await jsonbinRequest(JSONBIN_BASE, {
-    method: 'PUT',
-    body: JSON.stringify(db),
-  })
+  ensureDbFile()
+  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), 'utf8')
 }
 
 function lawState(db, lawId) {
@@ -119,7 +341,6 @@ function lawState(db, lawId) {
     db.lawFeedback[lawId] = {
       citizenVotes: {},
       usefulnessVotes: {},
-      comments: [],
     }
   }
   return db.lawFeedback[lawId]
@@ -138,7 +359,6 @@ function summarizeLawFeedback(feedback) {
       useful: usefulnessValues.filter((value) => value === 'useful').length,
       useless: usefulnessValues.filter((value) => value === 'useless').length,
     },
-    comments: feedback.comments,
   }
 }
 
@@ -168,23 +388,6 @@ function publicUser(user) {
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
-})
-
-app.get('/api/debug-jsonbin', async (_req, res) => {
-  const binId = process.env.JSONBIN_BIN_ID
-  const apiKey = process.env.JSONBIN_API_KEY
-  const url = `https://api.jsonbin.io/v3/b/${binId}/latest`
-  const keyPreview = apiKey ? `${apiKey.slice(0, 10)}...${apiKey.slice(-4)}` : '(not set)'
-
-  try {
-    const response = await fetch(url, {
-      headers: { 'X-Master-Key': apiKey, 'Content-Type': 'application/json' },
-    })
-    const text = await response.text()
-    res.json({ url, keyPreview, status: response.status, body: text.slice(0, 500) })
-  } catch (error) {
-    res.json({ url, keyPreview, error: error.message })
-  }
 })
 
 app.post('/api/auth/register', async (req, res) => {
@@ -256,7 +459,8 @@ app.get('/api/auth/me', authRequired, (req, res) => {
 
 app.get('/api/laws', async (_req, res) => {
   try {
-    const laws = readJson(lawsPath)
+    const laws = await loadActiveLaws()
+
     const db = await readDb()
 
     const items = laws.map((law) => {
@@ -286,7 +490,7 @@ app.post('/api/laws/:lawId/citizen-vote', authRequired, async (req, res) => {
       return res.status(400).json({ message: 'Vote must be support or oppose.' })
     }
 
-    const laws = readJson(lawsPath)
+    const laws = await loadActiveLaws()
     if (!laws.some((law) => law.id === lawId)) {
       return res.status(404).json({ message: 'Law not found.' })
     }
@@ -312,7 +516,7 @@ app.post('/api/laws/:lawId/usefulness', authRequired, async (req, res) => {
       return res.status(400).json({ message: 'Vote must be useful or useless.' })
     }
 
-    const laws = readJson(lawsPath)
+    const laws = await loadActiveLaws()
     if (!laws.some((law) => law.id === lawId)) {
       return res.status(404).json({ message: 'Law not found.' })
     }
@@ -325,43 +529,6 @@ app.post('/api/laws/:lawId/usefulness', authRequired, async (req, res) => {
     res.json({ citizen: summarizeLawFeedback(feedback) })
   } catch (error) {
     console.error('usefulness error:', error.message)
-    res.status(500).json({ message: error.message })
-  }
-})
-
-app.post('/api/laws/:lawId/comments', authRequired, async (req, res) => {
-  try {
-    const { lawId } = req.params
-    const { text } = req.body
-
-    if (!text || String(text).trim().length < 2) {
-      return res.status(400).json({ message: 'Comment must have at least 2 characters.' })
-    }
-
-    const laws = readJson(lawsPath)
-    if (!laws.some((law) => law.id === lawId)) {
-      return res.status(404).json({ message: 'Law not found.' })
-    }
-
-    const db = await readDb()
-    const feedback = lawState(db, lawId)
-    const comment = {
-      id: randomUUID(),
-      userId: req.user.id,
-      userName: req.user.name,
-      text: String(text).trim(),
-      createdAt: new Date().toISOString(),
-    }
-
-    feedback.comments.unshift(comment)
-    if (feedback.comments.length > 200) {
-      feedback.comments = feedback.comments.slice(0, 200)
-    }
-
-    await writeDb(db)
-    res.status(201).json({ citizen: summarizeLawFeedback(feedback) })
-  } catch (error) {
-    console.error('comments error:', error.message)
     res.status(500).json({ message: error.message })
   }
 })
