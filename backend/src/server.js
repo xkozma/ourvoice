@@ -485,7 +485,7 @@ async function callGoogleGenerative(prompt) {
   const apiKey = process.env.GOOGLE_API_KEY || process.env.GENERATIVE_API_KEY
   if (!apiKey) throw new Error('Missing Google API key')
 
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent'
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent'
 
   const body = {
     contents: [
