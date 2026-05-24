@@ -67,7 +67,7 @@ function SplitDonutChart({
   return (
     <div className="split-chart">
       <h5>{title}</h5>
-      <div className="chart-container">
+      <div className="chart-container" style={{ minHeight: 140, minWidth: 0 }}>
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Pie data={data} dataKey="value" nameKey="label" innerRadius={50} outerRadius={80}>

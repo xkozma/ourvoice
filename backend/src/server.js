@@ -6,8 +6,9 @@ import path from 'node:path'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { load as loadCheerio } from 'cheerio'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import supabase from './supabaseClient.js'
 
 dotenv.config({ path: new URL('../.env', import.meta.url) })
 
@@ -23,10 +24,16 @@ const dataDir = path.join(__dirname, '..', 'data')
 const lawsPath = path.join(dataDir, 'laws.json')
 const DB_PATH = path.join(dataDir, 'db.json')
 const EXPLANATIONS_PATH = path.join(dataDir, 'law-explanations.json')
+const LAWS_CACHE_PATH = path.join(dataDir, 'laws-cache.json')
 const frontendDistPath = path.join(__dirname, '..', '..', 'frontend', 'dist')
 const frontendIndexPath = path.join(frontendDistPath, 'index.html')
 
 function ensureDbFile() {
+  const dir = path.dirname(DB_PATH)
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+  }
+
   if (!fs.existsSync(DB_PATH)) {
     fs.writeFileSync(
       DB_PATH,
@@ -36,20 +43,72 @@ function ensureDbFile() {
   }
 }
 
-function ensureExplanationsFile() {
-  if (!fs.existsSync(EXPLANATIONS_PATH)) {
-    fs.writeFileSync(EXPLANATIONS_PATH, JSON.stringify({}, null, 2), 'utf8')
+async function readExplanations() {
+  try {
+    const { data, error } = await supabase
+      .from('law_explanations')
+      .select('law_id, explanation_text, source_url, generated_at')
+
+    if (error) {
+      console.error('readExplanations supabase error:', error.message)
+      return {}
+    }
+
+    const out = {}
+    for (const row of data || []) {
+      out[row.law_id] = {
+        text: row.explanation_text,
+        sourceUrl: row.source_url,
+        generatedAt: row.generated_at,
+      }
+    }
+    return out
+  } catch (err) {
+    console.error('readExplanations error:', err.message)
+    return {}
   }
 }
 
-function readExplanations() {
-  ensureExplanationsFile()
-  return JSON.parse(fs.readFileSync(EXPLANATIONS_PATH, 'utf8'))
-}
+async function upsertExplanation(lawId, entry) {
+  try {
+    // Only insert if an explanation for this law_id does not already exist.
+    const { data: existing, error: selectErr } = await supabase
+      .from('law_explanations')
+      .select('law_id, explanation_text, source_url, generated_at')
+      .eq('law_id', lawId)
+      .limit(1)
 
-function writeExplanations(obj) {
-  ensureExplanationsFile()
-  fs.writeFileSync(EXPLANATIONS_PATH, JSON.stringify(obj, null, 2), 'utf8')
+    if (selectErr) {
+      console.error('upsertExplanation select error:', selectErr.message)
+      return
+    }
+
+    if (existing && existing.length > 0) {
+      // Do not overwrite existing explanation
+      return
+    }
+
+    const record = {
+      law_id: lawId,
+      explanation_text: entry.text,
+      source_url: entry.sourceUrl || null,
+      generated_at: entry.generatedAt || new Date().toISOString(),
+      model: entry.model || null,
+      meta: entry.meta || {},
+    }
+
+    const { error } = await supabase.from('law_explanations').insert(record)
+    if (error) {
+      // Ignore duplicate-key race conditions — another worker inserted meanwhile
+      const msg = String(error.message || '')
+      if (msg.includes('duplicate key value') || msg.includes('unique constraint')) {
+        return
+      }
+      console.error('upsertExplanation insert error:', error.message)
+    }
+  } catch (err) {
+    console.error('upsertExplanation exception:', err.message)
+  }
 }
 
 const NRSR_VOTING_URL = 'https://www.nrsr.sk/web/default.aspx?SectionId=108'
@@ -307,17 +366,90 @@ async function loadActiveLaws() {
   if (activeLawsCache.expiresAt > now && activeLawsCache.items.length) {
     return activeLawsCache.items
   }
+  // Prefer reading recent laws from Supabase if available
+  try {
+    const { data, error } = await supabase
+      .from('laws')
+      .select('id, title, summary, status, category, introduced_on, voted_on, source_url, documents_url, cpt, raw')
+      .order('introduced_on', { ascending: false })
+      .limit(10)
 
-  let laws = await loadNRSRLaws()
-  if (!laws.length) {
-    laws = readJson(lawsPath).slice(0, 10)
+    if (!error && data && data.length) {
+      const mapped = data.map((row) => {
+        const raw = row.raw || {}
+        return {
+          id: row.id,
+          title: row.title,
+          summary: row.summary || raw.summary || row.title,
+          status: row.status || raw.status || inferStatus(row.title || row.summary || ''),
+          category: row.category || inferCategory(row.title || row.summary || ''),
+          introducedOn: row.introduced_on || raw.introducedOn || null,
+          votedOn: row.voted_on || raw.votedOn || null,
+          governmentVote: raw.governmentVote || raw.government_vote || { for: 0, against: 0, abstain: 0 },
+          resultNote: raw.resultNote || row.summary || null,
+          sourceUrl: row.source_url || raw.sourceUrl || NRSR_VOTING_URL,
+          votingUrl: raw.votingUrl || row.voting_url || null,
+          cpt: row.cpt || raw.cpt || null,
+          documentsUrl: row.documents_url || raw.documentsUrl || null,
+        }
+      })
+
+      activeLawsCache = { items: mapped, expiresAt: now + 5 * 60 * 1000 }
+      return mapped
+    }
+  } catch (err) {
+    console.error('loadActiveLaws supabase read error:', err.message)
   }
 
-  activeLawsCache = {
-    items: laws,
-    expiresAt: now + 5 * 60 * 1000,
+  // If Supabase had no laws, fall back to fetching/parsing NRSR and persist into Supabase
+  const cached = readLawsCache()
+
+  try {
+    const res = await fetch(NRSR_VOTING_URL, { headers: NRSR_HEADERS })
+      if (res.ok) {
+      const html = await res.text()
+      // Do not rely on local cache files; parse live page and upsert to Supabase
+
+      // Delegate to full parser which will fetch and parse
+      let laws = await loadNRSRLaws()
+
+      // Upsert fetched laws into Supabase for future reads
+      try {
+        for (const l of laws) {
+          await supabase.from('laws').upsert({
+            id: l.id,
+            title: l.title,
+            summary: l.summary,
+            status: l.status,
+            category: l.category,
+            introduced_on: l.introducedOn || null,
+            voted_on: l.votedOn || null,
+            source_url: l.sourceUrl || null,
+            documents_url: l.documentsUrl || null,
+            cpt: l.cpt || null,
+            raw: l,
+          }, { onConflict: 'id' })
+        }
+      } catch (err) {
+        console.error('upsert laws to supabase error:', err.message)
+      }
+
+      activeLawsCache = { items: laws, expiresAt: now + 5 * 60 * 1000 }
+      return laws
+    }
+  } catch (err) {
+    // If fetch failed, fall back to cache or bundled laws
   }
 
+  // Fallback: use persisted cache if available
+  if (cached && Array.isArray(cached.items) && cached.items.length) {
+    activeLawsCache = { items: cached.items, expiresAt: now + 5 * 60 * 1000 }
+    return cached.items
+  }
+
+  // Final fallback: bundled laws file
+  const laws = readJson(lawsPath).slice(0, 10)
+  activeLawsCache = { items: laws, expiresAt: now + 5 * 60 * 1000 }
   return laws
 }
 
@@ -357,12 +489,29 @@ app.use(
 
       return callback(null, false)
     },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
   })
 )
 app.use(express.json())
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'))
+}
+
+function ensureLawsCacheFile() {
+  // Archive-only: do not create or rely on local laws cache file when using Supabase
+  return
+}
+
+function readLawsCache() {
+  // Always prefer Supabase; do not read local cache files
+  return { items: [], hash: null, fetchedAt: null }
+}
+
+function writeLawsCache(obj) {
+  // Skip writing local cache when using Supabase
+  return
 }
 
 async function readDb() {
@@ -386,6 +535,67 @@ function lawState(db, lawId) {
   return db.lawFeedback[lawId]
 }
 
+async function getFeedback(lawId) {
+  try {
+    const { data, error } = await supabase.from('law_feedback').select('citizen_votes, usefulness_votes, comments').eq('law_id', lawId).limit(1)
+    if (error) {
+      console.error('getFeedback supabase error:', error.message)
+      return { citizenVotes: {}, usefulnessVotes: {}, comments: [] }
+    }
+    if (!data || data.length === 0) return { citizenVotes: {}, usefulnessVotes: {}, comments: [] }
+    const row = data[0]
+    return {
+      citizenVotes: row.citizen_votes || {},
+      usefulnessVotes: row.usefulness_votes || {},
+      comments: row.comments || [],
+    }
+  } catch (err) {
+    console.error('getFeedback error:', err.message)
+    return { citizenVotes: {}, usefulnessVotes: {}, comments: [] }
+  }
+}
+
+async function upsertFeedback(lawId, feedback) {
+  try {
+    const record = {
+      law_id: lawId,
+      citizen_votes: feedback.citizenVotes || {},
+      usefulness_votes: feedback.usefulnessVotes || {},
+      comments: feedback.comments || [],
+    }
+
+    // Some Supabase/Postgres schemas may not have a unique constraint on `law_id`.
+    // Use select -> insert or update to avoid ON CONFLICT errors.
+    const { data: existing, error: selectErr } = await supabase
+      .from('law_feedback')
+      .select('law_id')
+      .eq('law_id', lawId)
+      .limit(1)
+
+    if (selectErr) {
+      console.error('upsertFeedback select error:', selectErr.message)
+      // Fallback to try upsert without onConflict
+      const { error: upsertErr } = await supabase.from('law_feedback').upsert(record)
+      if (upsertErr) console.error('upsertFeedback fallback upsert error:', upsertErr.message)
+      return
+    }
+
+    if (existing && existing.length > 0) {
+      const { error: updateErr } = await supabase
+        .from('law_feedback')
+        .update({ citizen_votes: record.citizen_votes, usefulness_votes: record.usefulness_votes, comments: record.comments })
+        .eq('law_id', lawId)
+      if (updateErr) console.error('upsertFeedback update error:', updateErr.message)
+      return
+    }
+
+    const { error: insertErr } = await supabase.from('law_feedback').insert(record)
+    if (insertErr) console.error('upsertFeedback insert error:', insertErr.message)
+  } catch (err) {
+    console.error('upsertFeedback exception:', err.message)
+  }
+}
+
 async function fetchDocumentTextFromUrl(url) {
   try {
     if (!url) return null
@@ -405,43 +615,54 @@ async function fetchDocumentTextFromUrl(url) {
         const href = previewAnchor.attr('href')
         const baseHref = makeAbsoluteNrsrUrl(href) || href
         const docIdMatch = baseHref.match(/DocID=(\d+)/)
+        // Try a larger window of consecutive DocIDs — some multi-page previews use adjacent DocIDs
         const docIds = docIdMatch
-          ? [0, 1, 2, 3].map((offset) => String(parseInt(docIdMatch[1], 10) + offset))
+          ? Array.from({ length: 16 }, (_, i) => String(parseInt(docIdMatch[1], 10) + i))
           : []
         
+        // Accumulate extracted text across pages
+        const accumulated = []
         for (const docId of docIds) {
           const previewUrl = docIdMatch ? baseHref.replace(/DocID=\d+/, `DocID=${docId}`) : baseHref
           try {
             const p = await fetch(previewUrl, { headers: NRSR_HEADERS })
             if (!p.ok) continue
+            const pContentType = (p.headers.get('content-type') || '').toLowerCase()
+            // Skip binary previews (images, pdfs) to avoid extracting binary metadata as text
+            if (!pContentType.includes('text/html') && !pContentType.includes('application/xhtml+xml') && !pContentType.includes('text/plain')) {
+              continue
+            }
             const body = await p.text()
+            console.log(`fetchDocumentTextFromUrl: fetched DocID=${docId} content-type=${pContentType} length=${body.length}`)
             // NRSR document renderer uses awspan class elements for all text
             if (body.includes('awspan')) {
               const awSpanMatches = body.match(/class="awspan[^"]*"[^>]*>([^<]+)</g) || []
-              if (awSpanMatches.length > 10) {
-                const extracted = awSpanMatches
-                  .map(m => {
-                    const match = m.match(/class="awspan[^"]*"[^>]*>([^<]+)</)  
-                    return match ? match[1] : ''
-                  })
-                  .filter(Boolean)
-                  .join(' ')
-                  .replace(/\s+/g, ' ')
-                  .trim()
-                if (extracted.length > 100) {
-                  return extracted
-                }
-              }
+              const extracted = awSpanMatches
+                .map((m) => {
+                  const match = m.match(/class=\"awspan[^\\\"]*\"[^>]*>([^<]+)</)
+                  return match ? match[1] : ''
+                })
+                .filter(Boolean)
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+              if (extracted.length) accumulated.push(extracted)
             }
             // Fallback: raw HTML extraction
             const extracted = extractTextFromHtml(body)
-            if (extracted.length > 100) {
-              return extracted
+            if (extracted.length) accumulated.push(extracted)
+            // If we amassed a decent amount of text across pages, return it
+            const joined = accumulated.join(' ').replace(/\s+/g, ' ').trim()
+            if (joined.length > 250) {
+              return joined
             }
           } catch (err) {
             // continue to next DocID
           }
         }
+        // If we exited the loop but have some accumulated text, return it
+        const joinedFinal = accumulated.join(' ').replace(/\s+/g, ' ').trim()
+        if (joinedFinal.length > 50) return joinedFinal
       }
 
       // Otherwise, try to find a link with text containing Návrh or Navrh
@@ -452,10 +673,15 @@ async function fetchDocumentTextFromUrl(url) {
         try {
           const p = await fetch(abs, { headers: NRSR_HEADERS })
           if (p.ok) {
-            const body = await p.text()
-            const extracted = extractTextFromHtml(body)
-            if (extracted.length > 100) {
-              return extracted
+            const pContentType = (p.headers.get('content-type') || '').toLowerCase()
+            if (!pContentType.includes('text/html') && !pContentType.includes('application/xhtml+xml') && !pContentType.includes('text/plain')) {
+              // don't try to extract text from binary content
+            } else {
+              const body = await p.text()
+              const extracted = extractTextFromHtml(body)
+              if (extracted.length > 100) {
+                return extracted
+              }
             }
           }
         } catch (err) {
@@ -463,17 +689,21 @@ async function fetchDocumentTextFromUrl(url) {
         }
       }
 
-      // Fall back to body text from cheerio
+      // Fall back to body text from cheerio (only if it looks like textual HTML)
       const bodyText = $('body').text()
       if (bodyText && bodyText.length > 50) {
         return extractTextFromHtml(bodyText)
       }
-      
+
       // Ultimate fallback: raw HTML extraction
       return extractTextFromHtml(text)
     }
 
-    // Non-HTML fallback: use raw text extraction
+    // Non-HTML fallback: avoid extracting from binary types (pdf/images)
+    if (contentType.includes('application/pdf') || contentType.startsWith('image/')) {
+      return null
+    }
+
     return extractTextFromHtml(text)
   } catch (error) {
     console.error('fetchDocumentTextFromUrl error:', error.message)
@@ -532,7 +762,7 @@ async function callGoogleGenerative(prompt) {
 
 async function generateExplanationForLaw(law) {
   try {
-    const explanations = readExplanations()
+    const explanations = await readExplanations()
     if (explanations[law.id]) return explanations[law.id]
 
     let docText = null
@@ -547,7 +777,13 @@ async function generateExplanationForLaw(law) {
       docText = `Title: ${law.title}\nSummary: ${law.summary || law.title}\nStatus: ${law.status || ''}\nCategory: ${law.category || ''}`
     }
 
-    const prompt = `Summarize the following law proposal in at most 3 sentences. Include at least one sentence describing how this will directly affect ordinary citizens in their daily life. Be concise and plain.\n\nLaw:\n${docText.slice(0, 3000)}`
+    const MAX_PROMPT_CHARS = 20000
+    const usedText = docText.length > MAX_PROMPT_CHARS ? docText.slice(0, MAX_PROMPT_CHARS) : docText
+    if (docText.length > usedText.length) {
+      console.log(`generateExplanationForLaw: docText truncated from ${docText.length} to ${usedText.length} chars for prompt`)
+    }
+
+    const prompt = `Summarize the following law proposal in at most 3 sentences. Include at least one sentence describing how this will directly affect ordinary citizens in their daily life. Be concise and plain.\n\nLaw:\n${usedText}`
 
     const aiText = await callGoogleGenerative(prompt)
 
@@ -556,16 +792,14 @@ async function generateExplanationForLaw(law) {
       sourceUrl: docUrl,
       generatedAt: new Date().toISOString(),
     }
-
-    explanations[law.id] = entry
-    writeExplanations(explanations)
+    console.log(`generateExplanationForLaw: law=${law.id} docUrl=${docUrl} docTextLength=${docText ? docText.length : 0}`)
+    await upsertExplanation(law.id, entry)
     return entry
   } catch (error) {
     console.error('generateExplanationForLaw error:', error.message)
     return null
   }
 }
-
 function summarizeLawFeedback(feedback) {
   const citizenVoteValues = Object.values(feedback.citizenVotes)
   const usefulnessValues = Object.values(feedback.usefulnessVotes)
@@ -619,25 +853,61 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const normalizedEmail = String(email).trim().toLowerCase()
-    const db = await readDb()
 
-    if (db.users.some((user) => user.email === normalizedEmail)) {
-      return res.status(409).json({ message: 'Email is already registered.' })
+    // Prefer Supabase-backed users table when available
+    try {
+      const { data: existing, error: selectErr } = await supabase
+        .from('users')
+        .select('id, name, email')
+        .eq('email', normalizedEmail)
+        .limit(1)
+
+      if (selectErr) throw selectErr
+
+      if (existing && existing.length > 0) {
+        return res.status(409).json({ message: 'Email is already registered.' })
+      }
+
+      const passwordHash = await bcrypt.hash(password, 10)
+      const newUser = {
+        id: randomUUID(),
+        name: String(name).trim(),
+        email: normalizedEmail,
+        password_hash: passwordHash,
+      }
+
+      const { data: inserted, error: insertErr } = await supabase.from('users').insert(newUser).select('id, name, email')
+      if (insertErr) {
+        console.error('supabase register insert error:', insertErr.message)
+        throw insertErr
+      }
+
+      const created = (inserted && inserted[0]) ? inserted[0] : { id: newUser.id, name: newUser.name, email: newUser.email }
+      const token = jwt.sign(publicUser(created), JWT_SECRET, { expiresIn: '7d' })
+      return res.status(201).json({ token, user: publicUser(created) })
+    } catch (err) {
+      // Fallback to local DB file if Supabase unavailable
+      console.warn('Supabase register failed, falling back to local DB:', err.message)
+      const db = await readDb()
+
+      if (db.users.some((user) => user.email === normalizedEmail)) {
+        return res.status(409).json({ message: 'Email is already registered.' })
+      }
+
+      const passwordHash = await bcrypt.hash(password, 10)
+      const user = {
+        id: randomUUID(),
+        name: String(name).trim(),
+        email: normalizedEmail,
+        passwordHash,
+      }
+
+      db.users.push(user)
+      await writeDb(db)
+
+      const token = jwt.sign(publicUser(user), JWT_SECRET, { expiresIn: '7d' })
+      return res.status(201).json({ token, user: publicUser(user) })
     }
-
-    const passwordHash = await bcrypt.hash(password, 10)
-    const user = {
-      id: randomUUID(),
-      name: String(name).trim(),
-      email: normalizedEmail,
-      passwordHash,
-    }
-
-    db.users.push(user)
-    await writeDb(db)
-
-    const token = jwt.sign(publicUser(user), JWT_SECRET, { expiresIn: '7d' })
-    return res.status(201).json({ token, user: publicUser(user) })
   } catch (error) {
     console.error('register error:', error.message)
     return res.status(500).json({ message: error.message })
@@ -653,20 +923,45 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   const normalizedEmail = String(email).trim().toLowerCase()
-  const db = await readDb()
-  const user = db.users.find((entry) => entry.email === normalizedEmail)
 
-  if (!user) {
-    return res.status(401).json({ message: 'Invalid email or password.' })
+  // Prefer Supabase users table for authentication
+  try {
+    const { data: rows, error: selectErr } = await supabase
+      .from('users')
+      .select('id, name, email, password_hash')
+      .eq('email', normalizedEmail)
+      .limit(1)
+
+    if (selectErr) throw selectErr
+
+    const rowUser = (rows && rows[0]) || null
+    if (!rowUser) {
+      // fallback to local DB
+      throw new Error('no-supabase-user')
+    }
+
+    const isValidPassword = await bcrypt.compare(password, rowUser.password_hash || '')
+    if (!isValidPassword) return res.status(401).json({ message: 'Invalid email or password.' })
+
+    const token = jwt.sign(publicUser(rowUser), JWT_SECRET, { expiresIn: '7d' })
+    return res.json({ token, user: publicUser(rowUser) })
+  } catch (err) {
+    if (err.message !== 'no-supabase-user') console.warn('Supabase login error, falling back to local DB:', err.message)
+    const db = await readDb()
+    const user = db.users.find((entry) => entry.email === normalizedEmail)
+
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid email or password.' })
+    }
+
+    const isValidPassword = await bcrypt.compare(password, user.passwordHash)
+    if (!isValidPassword) {
+      return res.status(401).json({ message: 'Invalid email or password.' })
+    }
+
+    const token = jwt.sign(publicUser(user), JWT_SECRET, { expiresIn: '7d' })
+    return res.json({ token, user: publicUser(user) })
   }
-
-  const isValidPassword = await bcrypt.compare(password, user.passwordHash)
-  if (!isValidPassword) {
-    return res.status(401).json({ message: 'Invalid email or password.' })
-  }
-
-  const token = jwt.sign(publicUser(user), JWT_SECRET, { expiresIn: '7d' })
-  return res.json({ token, user: publicUser(user) })
   } catch (error) {
     console.error('login error:', error.message)
     return res.status(500).json({ message: error.message })
@@ -681,40 +976,23 @@ app.get('/api/laws', async (_req, res) => {
   try {
     const laws = await loadActiveLaws()
 
-    const db = await readDb()
-    const explanations = readExplanations()
+    const explanations = await readExplanations()
 
-    const items = laws.map((law) => {
-      const feedback = lawState(db, law.id)
-      const summary = summarizeLawFeedback(feedback)
-      const explanationEntry = explanations[law.id]
+    const items = await Promise.all(
+      laws.map(async (law) => {
+        const feedback = await getFeedback(law.id)
+        const summary = summarizeLawFeedback(feedback)
+        const explanationEntry = explanations[law.id]
 
-      return {
-        ...law,
-        citizen: summary,
-        aiExplanation: explanationEntry ? explanationEntry.text : null,
-      }
-    })
-
-    // Persist any initial DB changes (e.g. lawFeedback initialization)
-    await writeDb(db)
-
-    // Trigger background generation for laws missing explanations
-    if (process.env.GOOGLE_API_KEY || process.env.GENERATIVE_API_KEY) {
-      ;(async () => {
-        try {
-          for (const law of laws) {
-            const current = readExplanations()
-            if (!current[law.id]) {
-              // generate but don't block the response
-              await generateExplanationForLaw(law)
-            }
-          }
-        } catch (err) {
-          console.error('background explanation generation error:', err.message)
+        return {
+          ...law,
+          citizen: summary,
+          aiExplanation: explanationEntry ? explanationEntry.text : null,
         }
-      })()
-    }
+      })
+    )
+    // Background explanation generation is performed on startup and via scheduled sync
+    // to avoid triggering heavy generation on every /api/laws request.
 
     res.json({ items })
   } catch (error) {
@@ -725,6 +1003,7 @@ app.get('/api/laws', async (_req, res) => {
 
 app.post('/api/laws/:lawId/citizen-vote', authRequired, async (req, res) => {
   try {
+    console.log('citizen-vote request:', { path: req.path, hasAuthorization: !!req.headers.authorization, body: req.body })
     const { lawId } = req.params
     const { vote } = req.body
 
@@ -737,10 +1016,9 @@ app.post('/api/laws/:lawId/citizen-vote', authRequired, async (req, res) => {
       return res.status(404).json({ message: 'Law not found.' })
     }
 
-    const db = await readDb()
-    const feedback = lawState(db, lawId)
+    const feedback = await getFeedback(lawId)
     feedback.citizenVotes[req.user.id] = vote
-    await writeDb(db)
+    await upsertFeedback(lawId, feedback)
 
     res.json({ citizen: summarizeLawFeedback(feedback) })
   } catch (error) {
@@ -751,6 +1029,7 @@ app.post('/api/laws/:lawId/citizen-vote', authRequired, async (req, res) => {
 
 app.post('/api/laws/:lawId/usefulness', authRequired, async (req, res) => {
   try {
+    console.log('usefulness request:', { path: req.path, hasAuthorization: !!req.headers.authorization, body: req.body })
     const { lawId } = req.params
     const { vote } = req.body
 
@@ -763,10 +1042,9 @@ app.post('/api/laws/:lawId/usefulness', authRequired, async (req, res) => {
       return res.status(404).json({ message: 'Law not found.' })
     }
 
-    const db = await readDb()
-    const feedback = lawState(db, lawId)
+    const feedback = await getFeedback(lawId)
     feedback.usefulnessVotes[req.user.id] = vote
-    await writeDb(db)
+    await upsertFeedback(lawId, feedback)
 
     res.json({ citizen: summarizeLawFeedback(feedback) })
   } catch (error) {
@@ -783,6 +1061,12 @@ app.post('/api/laws/:lawId/generate-explanation', async (req, res) => {
     const law = laws.find((l) => l.id === lawId)
     if (!law) return res.status(404).json({ message: 'Law not found.' })
 
+    // Do not regenerate if an explanation already exists.
+    const explanations = await readExplanations()
+    if (explanations[lawId]) {
+      return res.status(200).json({ explanation: explanations[lawId], message: 'Existing explanation returned; regeneration is disabled.' })
+    }
+
     const entry = await generateExplanationForLaw(law)
     if (!entry) return res.status(500).json({ message: 'Failed to generate explanation.' })
 
@@ -790,6 +1074,25 @@ app.post('/api/laws/:lawId/generate-explanation', async (req, res) => {
   } catch (error) {
     console.error('generate-explanation error:', error.message)
     res.status(500).json({ message: error.message })
+  }
+})
+
+// Debug endpoint: fetch a document URL and show content-type, length and extracted text
+app.get('/api/debug/extract', async (req, res) => {
+  try {
+    const url = req.query.url
+    if (!url) return res.status(400).json({ message: 'Missing url query param' })
+
+    const response = await fetch(String(url), { headers: NRSR_HEADERS })
+    const contentType = response.headers.get('content-type') || null
+    const body = await response.text()
+
+    const extracted = await fetchDocumentTextFromUrl(String(url))
+
+    res.json({ url, contentType, bodyLength: body.length, extracted: extracted || null })
+  } catch (err) {
+    console.error('debug extract error:', err.message)
+    res.status(500).json({ message: err.message })
   }
 })
 
@@ -812,3 +1115,141 @@ if (fs.existsSync(frontendIndexPath)) {
 app.listen(PORT, () => {
   console.log(`OurVoice backend running on http://localhost:${PORT}`)
 })
+
+// ----- NRSR sync: fetch latest laws and upsert to Supabase -----
+let syncing = false
+async function syncLaws() {
+  if (syncing) {
+    console.log('syncLaws: already running, skipping')
+    return { ok: false, message: 'already running' }
+  }
+
+  try {
+    syncing = true
+    console.log('syncLaws: starting NRSR sync')
+    const laws = await loadNRSRLaws()
+    if (!Array.isArray(laws) || laws.length === 0) {
+      console.log('syncLaws: no laws fetched')
+      return { ok: true, inserted: 0, updated: 0 }
+    }
+
+    let inserted = 0
+    let updated = 0
+
+    for (const l of laws) {
+      // Upsert will insert or update; we can treat all as upserts for simplicity
+      const { error } = await supabase.from('laws').upsert({
+        id: l.id,
+        title: l.title,
+        summary: l.summary,
+        status: l.status,
+        category: l.category,
+        introduced_on: l.introducedOn || null,
+        voted_on: l.votedOn || null,
+        source_url: l.sourceUrl || null,
+        documents_url: l.documentsUrl || null,
+        cpt: l.cpt || null,
+        raw: l,
+      }, { onConflict: 'id' })
+
+      if (error) {
+        console.error('syncLaws upsert error for', l.id, error.message)
+      } else {
+        // We cannot easily detect insert vs update from supabase-js here without returning; count as upsert
+        inserted += 1
+      }
+    }
+
+    console.log(`syncLaws: finished, processed ${inserted} items`)
+
+    // Start background generation for any laws missing explanations (non-blocking)
+    ;(async () => {
+      try {
+        const explanations = await readExplanations()
+        const toGenerate = laws.filter((l) => !explanations[l.id])
+        if (toGenerate.length) console.log(`syncLaws: will auto-generate ${toGenerate.length} explanations in background`)
+        for (const law of toGenerate) {
+          ;(async (law) => {
+            try {
+              console.log(`auto-generate: starting ${law.id}`)
+              await generateExplanationForLaw(law)
+              console.log(`auto-generate: finished ${law.id}`)
+            } catch (err) {
+              console.error(`auto-generate error for ${law.id}:`, err.message)
+            }
+          })(law)
+        }
+      } catch (err) {
+        console.error('syncLaws background generation error:', err.message)
+      }
+    })()
+
+    return { ok: true, inserted, updated }
+  } catch (err) {
+    console.error('syncLaws error:', err.message)
+    return { ok: false, message: err.message }
+  } finally {
+    syncing = false
+  }
+}
+
+app.post('/api/sync-laws', async (_req, res) => {
+  try {
+    const result = await syncLaws()
+    if (!result.ok) return res.status(500).json(result)
+    return res.json(result)
+  } catch (err) {
+    console.error('sync-laws endpoint error:', err.message)
+    return res.status(500).json({ ok: false, message: err.message })
+  }
+})
+
+// Schedule daily midnight sync: compute delay until next local midnight
+function scheduleDailyMidnight(task) {
+  const now = new Date()
+  const next = new Date(now)
+  next.setHours(24, 0, 0, 0) // next midnight
+  const delay = next.valueOf() - now.valueOf()
+  console.log(`scheduleDailyMidnight: first run in ${Math.round(delay / 1000)}s`) 
+  setTimeout(() => {
+    task()
+    setInterval(task, 24 * 60 * 60 * 1000)
+  }, delay)
+}
+
+// Run sync on startup (non-blocking) and schedule daily
+;(async () => {
+  try {
+    console.log('startup: triggering syncLaws')
+    await syncLaws()
+    scheduleDailyMidnight(() => {
+      console.log('daily sync: running syncLaws')
+      syncLaws().catch((e) => console.error('daily sync error:', e.message))
+    })
+  } catch (err) {
+    console.error('startup sync error:', err.message)
+  }
+})()
+
+// On startup run a one-shot sweep to generate any missing explanations (non-blocking)
+if (process.env.GOOGLE_API_KEY || process.env.GENERATIVE_API_KEY) {
+  ;(async () => {
+    try {
+      console.log('initial explanation sweep: starting')
+      const laws = await loadActiveLaws()
+      for (const law of laws) {
+        const current = await readExplanations()
+        if (current[law.id]) {
+          console.log(`initial explanation sweep: already have ${law.id}`)
+          continue
+        }
+        console.log(`initial explanation sweep: generating ${law.id}`)
+        await generateExplanationForLaw(law)
+        console.log(`initial explanation sweep: generated ${law.id}`)
+      }
+      console.log('initial explanation sweep: finished')
+    } catch (err) {
+      console.error('initial explanation sweep error:', err.message)
+    }
+  })()
+}
