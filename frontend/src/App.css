@@ -122,6 +122,12 @@
   margin: 0;
 }
 
+.phone-privacy {
+  font-size: 0.75rem;
+  opacity: 0.55;
+  margin-top: 0.25rem !important;
+}
+
 .otp-prompt {
   margin: 0;
 }

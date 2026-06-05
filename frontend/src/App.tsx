@@ -344,6 +344,10 @@ function App() {
                   </div>
                 </label>
                 <p className="helper-small">{t.phoneHint}</p>
+                <p className="helper-small phone-privacy">{t.phonePrivacy}</p>
+                {import.meta.env.VITE_DEV === 'true' && (
+                  <p className="dev-hint">{t.devPhoneHint}</p>
+                )}
               </>
             ) : (
               <>
