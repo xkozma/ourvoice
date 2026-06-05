@@ -282,6 +282,7 @@ function mapBillToLaw(bill) {
   const billId = String(bill.billNumber ?? '')
 
   return {
+    _cached: bill._cached || false,
     id: createBillId(billId, title),
     title,
     summary,
@@ -387,8 +388,9 @@ async function loadNRSRLaws() {
     for (const bill of latest) {
       const billId = createBillId(String(bill.billNumber ?? ''), String(bill.title ?? ''))
       if (existingIds.has(billId)) {
-        // Reuse whatever is in Supabase — syncLaws will upsert the rest unchanged
-        withVotes.push(bill)
+        // Already in Supabase with real vote data — skip detail fetch AND skip re-upsert
+        // (upserting would overwrite the real numbers with 0s from the list-page scrape)
+        withVotes.push({ ...bill, _cached: true })
         continue
       }
       // Small delay between requests to nrsr.sk
@@ -1295,6 +1297,10 @@ async function syncLaws() {
     let updated = 0
 
     for (const l of laws) {
+      // Skip laws that were already in Supabase with vote data — upserting would
+      // overwrite real numbers with zeros from the list-page scrape.
+      if (l._cached) continue
+
       // Upsert will insert or update; we can treat all as upserts for simplicity
       const { error } = await supabase.from('laws').upsert({
         id: l.id,
@@ -1307,7 +1313,7 @@ async function syncLaws() {
         source_url: l.sourceUrl || null,
         documents_url: l.documentsUrl || null,
         cpt: l.cpt || null,
-        raw: l,
+        raw: { ...l, _cached: undefined },
       }, { onConflict: 'id' })
 
       if (error) {
