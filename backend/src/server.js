@@ -365,21 +365,46 @@ async function loadNRSRLaws() {
       .sort((a, b) => b.timestamp - a.timestamp || b.voteNumber - a.voteNumber)
       .slice(0, 10)
 
-    const withVotes = await Promise.all(
-      latest.map(async (bill) => {
-        const voting = await fetchVotingDetails(bill.votingUrl)
-        return {
-          ...bill,
-          votedOn: voting.votedOn,
-          status: voting.status,
-          governmentVote: {
-            for: voting.for,
-            against: voting.against,
-            abstain: voting.abstain,
-          },
-        }
+    // Check which bills already have complete vote data in Supabase to avoid
+    // unnecessary requests to nrsr.sk for detail pages
+    const existingIds = new Set()
+    try {
+      const ids = latest.map((b) => createBillId(String(b.billNumber ?? ''), String(b.title ?? '')))
+      const { data: existing } = await supabase
+        .from('laws')
+        .select('id, raw')
+        .in('id', ids)
+      for (const row of existing || []) {
+        const gv = row.raw?.governmentVote || {}
+        const total = (gv.for || 0) + (gv.against || 0) + (gv.abstain || 0)
+        if (total > 0) existingIds.add(row.id)
+      }
+    } catch (_) { /* non-fatal — fall through to full fetch */ }
+
+    // Fetch detail pages sequentially (not parallel) to be polite to nrsr.sk,
+    // and skip any bill whose vote data we already have
+    const withVotes = []
+    for (const bill of latest) {
+      const billId = createBillId(String(bill.billNumber ?? ''), String(bill.title ?? ''))
+      if (existingIds.has(billId)) {
+        // Reuse whatever is in Supabase — syncLaws will upsert the rest unchanged
+        withVotes.push(bill)
+        continue
+      }
+      // Small delay between requests to nrsr.sk
+      await new Promise((r) => setTimeout(r, 300))
+      const voting = await fetchVotingDetails(bill.votingUrl)
+      withVotes.push({
+        ...bill,
+        votedOn: voting.votedOn,
+        status: voting.status,
+        governmentVote: {
+          for: voting.for,
+          against: voting.against,
+          abstain: voting.abstain,
+        },
       })
-    )
+    }
 
     return withVotes.map(mapBillToLaw)
   } catch (error) {
