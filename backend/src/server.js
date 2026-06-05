@@ -6,8 +6,9 @@ import path from 'node:path'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { load as loadCheerio } from 'cheerio'
-import { randomUUID, createHash } from 'node:crypto'
+import { randomUUID, createHash, randomInt, timingSafeEqual } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import twilio from 'twilio'
 import supabase from './supabaseClient.js'
 
 dotenv.config({ path: new URL('../.env', import.meta.url) })
@@ -15,8 +16,27 @@ dotenv.config({ path: new URL('../.env', import.meta.url) })
 const app = express()
 const PORT = process.env.PORT || 4000
 const JWT_SECRET = process.env.JWT_SECRET || 'ourvoice-dev-secret'
+const TWILIO_FROM = process.env.TWILIO_FROM || '+14058515936'
+const DEV = process.env.DEV === 'true'
+const DEV_BYPASS_CODE = '456123'
 const DEFAULT_CORS_ORIGINS = ['http://localhost:5173']
 const hasExplicitCorsOrigins = Boolean(process.env.CORS_ORIGIN?.trim())
+
+// Twilio client — initialised lazily so missing creds only error at runtime
+let _twilioClient = null
+function getTwilioClient() {
+  if (!_twilioClient) {
+    const sid = process.env.TWILIO_ACCOUNT_SID
+    const token = process.env.TWILIO_AUTH_TOKEN
+    if (!sid || !token) throw new Error('TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set.')
+    _twilioClient = twilio(sid, token)
+  }
+  return _twilioClient
+}
+
+// In-memory OTP store: phone → { hash, expiresAt, sentAt }
+// (single-instance; fine for this use case)
+const otpStore = new Map()
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -47,7 +67,7 @@ async function readExplanations() {
   try {
     const { data, error } = await supabase
       .from('law_explanations')
-      .select('law_id, explanation_text, source_url, generated_at')
+      .select('law_id, explanation_text, source_url, generated_at, meta')
 
     if (error) {
       console.error('readExplanations supabase error:', error.message)
@@ -58,6 +78,7 @@ async function readExplanations() {
     for (const row of data || []) {
       out[row.law_id] = {
         text: row.explanation_text,
+        textSk: row.meta?.text_sk || null,
         sourceUrl: row.source_url,
         generatedAt: row.generated_at,
       }
@@ -71,10 +92,9 @@ async function readExplanations() {
 
 async function upsertExplanation(lawId, entry) {
   try {
-    // Only insert if an explanation for this law_id does not already exist.
     const { data: existing, error: selectErr } = await supabase
       .from('law_explanations')
-      .select('law_id, explanation_text, source_url, generated_at')
+      .select('law_id, meta')
       .eq('law_id', lawId)
       .limit(1)
 
@@ -84,7 +104,15 @@ async function upsertExplanation(lawId, entry) {
     }
 
     if (existing && existing.length > 0) {
-      // Do not overwrite existing explanation
+      // Record exists — only patch in SK text if it's missing
+      const currentMeta = existing[0].meta || {}
+      if (!currentMeta.text_sk && entry.textSk) {
+        const { error: updateErr } = await supabase
+          .from('law_explanations')
+          .update({ meta: { ...currentMeta, text_sk: entry.textSk } })
+          .eq('law_id', lawId)
+        if (updateErr) console.error('upsertExplanation meta update error:', updateErr.message)
+      }
       return
     }
 
@@ -94,12 +122,11 @@ async function upsertExplanation(lawId, entry) {
       source_url: entry.sourceUrl || null,
       generated_at: entry.generatedAt || new Date().toISOString(),
       model: entry.model || null,
-      meta: entry.meta || {},
+      meta: { ...(entry.meta || {}), ...(entry.textSk ? { text_sk: entry.textSk } : {}) },
     }
 
     const { error } = await supabase.from('law_explanations').insert(record)
     if (error) {
-      // Ignore duplicate-key race conditions — another worker inserted meanwhile
       const msg = String(error.message || '')
       if (msg.includes('duplicate key value') || msg.includes('unique constraint')) {
         return
@@ -261,7 +288,9 @@ function mapBillToLaw(bill) {
     status: bill.status || inferStatus(`${title} ${summary}`),
     category: inferCategory(`${title} ${summary}`),
     introducedOn: bill.date,
-    votedOn: bill.votedOn || null,
+    // If the detail-page date regex didn't match, fall back to the list-page date
+    // (the NRSR list only shows completed votes, so that date IS the voting date)
+    votedOn: bill.votedOn || bill.date || null,
     governmentVote: bill.governmentVote || {
       for: 0,
       against: 0,
@@ -384,7 +413,14 @@ async function loadActiveLaws() {
           status: row.status || raw.status || inferStatus(row.title || row.summary || ''),
           category: row.category || inferCategory(row.title || row.summary || ''),
           introducedOn: row.introduced_on || raw.introducedOn || null,
-          votedOn: row.voted_on || raw.votedOn || null,
+          votedOn: (() => {
+            if (row.voted_on) return row.voted_on
+            if (raw.votedOn) return raw.votedOn
+            // If vote counts exist the law was already voted on — use introducedOn as the date
+            const gv = raw.governmentVote || raw.government_vote || {}
+            const totalVotes = (gv.for || 0) + (gv.against || 0) + (gv.abstain || 0)
+            return totalVotes > 0 ? (row.introduced_on || raw.introducedOn || null) : null
+          })(),
           governmentVote: raw.governmentVote || raw.government_vote || { for: 0, against: 0, abstain: 0 },
           resultNote: raw.resultNote || row.summary || null,
           sourceUrl: row.source_url || raw.sourceUrl || NRSR_VOTING_URL,
@@ -763,7 +799,10 @@ async function callGoogleGenerative(prompt) {
 async function generateExplanationForLaw(law) {
   try {
     const explanations = await readExplanations()
-    if (explanations[law.id]) return explanations[law.id]
+    const existing = explanations[law.id]
+
+    // If both languages already exist, nothing to do
+    if (existing && existing.text && existing.textSk) return existing
 
     let docText = null
     const docUrl = law.documentsUrl || law.sourceUrl || null
@@ -772,7 +811,6 @@ async function generateExplanationForLaw(law) {
       docText = await fetchDocumentTextFromUrl(docUrl)
     }
 
-    // If no doc text from URL, generate from summary/title directly
     if (!docText || docText.length < 100) {
       docText = `Title: ${law.title}\nSummary: ${law.summary || law.title}\nStatus: ${law.status || ''}\nCategory: ${law.category || ''}`
     }
@@ -783,12 +821,17 @@ async function generateExplanationForLaw(law) {
       console.log(`generateExplanationForLaw: docText truncated from ${docText.length} to ${usedText.length} chars for prompt`)
     }
 
-    const prompt = `Summarize the following law proposal in at most 3 sentences. Include at least one sentence describing how this will directly affect ordinary citizens in their daily life. Be concise and plain.\n\nLaw:\n${usedText}`
+    const enText = existing?.text || await callGoogleGenerative(
+      `Summarize the following law proposal in at most 3 sentences. Include at least one sentence describing how this will directly affect ordinary citizens in their daily life. Be concise and plain.\n\nLaw:\n${usedText}`
+    )
 
-    const aiText = await callGoogleGenerative(prompt)
+    const skText = existing?.textSk || await callGoogleGenerative(
+      `Zhrňte nasledujúci návrh zákona v najviac 3 vetách v slovenskom jazyku. Zahrňte aspoň jednu vetu popisujúcu, ako to priamo ovplyvní bežných občanov v ich každodennom živote. Buďte stručný a zrozumiteľný.\n\nZákon:\n${usedText}`
+    )
 
     const entry = {
-      text: aiText,
+      text: enText,
+      textSk: skText,
       sourceUrl: docUrl,
       generatedAt: new Date().toISOString(),
     }
@@ -825,18 +868,13 @@ function authRequired(req, res, next) {
   const token = authHeader.slice('Bearer '.length)
   try {
     const payload = jwt.verify(token, JWT_SECRET)
-    req.user = payload
+    if (!payload.phone || !payload.phone.startsWith('+421')) {
+      return res.status(403).json({ message: 'Only Slovak (+421) phone numbers are permitted.' })
+    }
+    req.user = { id: payload.id, phone: payload.phone }
     return next()
   } catch {
     return res.status(401).json({ message: 'Invalid or expired token.' })
-  }
-}
-
-function publicUser(user) {
-  return {
-    id: user.id,
-    name: user.name,
-    email: user.email,
   }
 }
 
@@ -844,6 +882,92 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true })
 })
 
+// Send OTP to a Slovak (+421) phone number via Twilio
+app.post('/api/auth/otp/request', async (req, res) => {
+  try {
+    const raw = String(req.body.phone || '').trim()
+    const phone = raw.startsWith('+') ? raw : `+421${raw.replace(/\D/g, '')}`
+
+    if (!/^\+421[0-9]{9}$/.test(phone)) {
+      return res.status(400).json({ message: 'Invalid phone number. Provide a Slovak +421 number with 9 digits.' })
+    }
+
+    // Rate-limit: one OTP per 60 seconds per number
+    const existing = otpStore.get(phone)
+    if (existing && Date.now() - existing.sentAt < 60_000) {
+      return res.status(429).json({ message: 'Please wait 60 seconds before requesting another code.' })
+    }
+
+    const otp = String(randomInt(0, 1_000_000)).padStart(6, '0')
+    const hash = createHash('sha256').update(`${phone}:${otp}`).digest('hex')
+    otpStore.set(phone, { hash, expiresAt: Date.now() + 5 * 60_000, sentAt: Date.now() })
+
+    if (DEV) {
+      // In DEV mode skip Twilio — use the bypass code 456123 or the logged OTP below
+      console.log(`[DEV] OTP for ${phone}: ${otp}`)
+      return res.json({ ok: true })
+    }
+
+    await getTwilioClient().messages.create({
+      body: `Your OurVoice verification code: ${otp}. Valid for 5 minutes.`,
+      from: TWILIO_FROM,
+      to: phone,
+    })
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error('otp/request error:', err.message)
+    return res.status(500).json({ message: 'Failed to send verification code.' })
+  }
+})
+
+// Verify OTP and return a signed JWT
+app.post('/api/auth/otp/verify', async (req, res) => {
+  try {
+    const raw = String(req.body.phone || '').trim()
+    const phone = raw.startsWith('+') ? raw : `+421${raw.replace(/\D/g, '')}`
+    const code = String(req.body.code || '').trim()
+
+    if (!/^\+421[0-9]{9}$/.test(phone)) {
+      return res.status(400).json({ message: 'Invalid phone number.' })
+    }
+    if (!/^[0-9]{6}$/.test(code)) {
+      return res.status(400).json({ message: 'Invalid code format.' })
+    }
+
+    // DEV bypass: code 456123 always works when DEV=true
+    const isDevBypass = DEV && code === DEV_BYPASS_CODE
+
+    if (!isDevBypass) {
+      const entry = otpStore.get(phone)
+      if (!entry || Date.now() > entry.expiresAt) {
+        return res.status(401).json({ message: 'Code expired or not found. Request a new one.' })
+      }
+
+      const expected = Buffer.from(entry.hash, 'hex')
+      const actual = Buffer.from(createHash('sha256').update(`${phone}:${code}`).digest('hex'), 'hex')
+      const valid = expected.length === actual.length && timingSafeEqual(expected, actual)
+
+      if (!valid) {
+        return res.status(401).json({ message: 'Incorrect verification code.' })
+      }
+
+      otpStore.delete(phone)
+    }
+
+    // Deterministic user ID from phone — same number always gets the same ID
+    const userId = createHash('sha256').update(`ourvoice-user:${phone}`).digest('hex').slice(0, 32)
+    const user = { id: userId, phone }
+    const token = jwt.sign(user, JWT_SECRET, { expiresIn: '30d' })
+
+    return res.json({ token, user })
+  } catch (err) {
+    console.error('otp/verify error:', err.message)
+    return res.status(500).json({ message: 'Verification failed.' })
+  }
+})
+
+// Legacy register — disabled (phone auth replaces this)
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, password } = req.body
@@ -914,7 +1038,10 @@ app.post('/api/auth/register', async (req, res) => {
   }
 })
 
+// Legacy login — disabled (phone auth replaces this)
 app.post('/api/auth/login', async (req, res) => {
+  return res.status(410).json({ message: 'Email/password login is no longer supported. Use phone OTP.' })
+  // eslint-disable-next-line no-unreachable
   try {
   const { email, password } = req.body
 
@@ -988,6 +1115,7 @@ app.get('/api/laws', async (_req, res) => {
           ...law,
           citizen: summary,
           aiExplanation: explanationEntry ? explanationEntry.text : null,
+          aiExplanationSk: explanationEntry ? explanationEntry.textSk : null,
         }
       })
     )
@@ -1239,7 +1367,8 @@ if (process.env.GOOGLE_API_KEY || process.env.GENERATIVE_API_KEY) {
       const laws = await loadActiveLaws()
       for (const law of laws) {
         const current = await readExplanations()
-        if (current[law.id]) {
+        const entry = current[law.id]
+        if (entry && entry.text && entry.textSk) {
           console.log(`initial explanation sweep: already have ${law.id}`)
           continue
         }

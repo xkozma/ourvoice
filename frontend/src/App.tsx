@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { Cell, Legend, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts'
+import { translations } from './i18n'
+import type { Lang } from './i18n'
 import './App.css'
 
-type User = {
+type AuthUser = {
   id: string
-  name: string
-  email: string
+  phone: string
 }
 
 type Law = {
@@ -37,6 +38,7 @@ type Law = {
     }
   }
   aiExplanation?: string | null
+  aiExplanationSk?: string | null
 }
 
 const rawApiBase = (import.meta.env.VITE_API_URL || '/api').trim().replace(/\/$/, '')
@@ -50,9 +52,9 @@ type SplitData = {
   value: number
 }
 
-function formatDate(date: string | null) {
-  if (!date) return 'Not voted yet'
-  return new Date(date).toLocaleDateString()
+function formatDate(date: string | null, lang: Lang) {
+  if (!date) return lang === 'sk' ? 'Ešte nehlasoval' : 'Not voted yet'
+  return new Date(date).toLocaleDateString(lang === 'sk' ? 'sk-SK' : 'en-GB')
 }
 
 function SplitDonutChart({
@@ -87,18 +89,40 @@ function SplitDonutChart({
 function App() {
   const [laws, setLaws] = useState<Law[]>([])
   const [selectedLaw, setSelectedLaw] = useState<Law | null>(null)
-  const [token, setToken] = useState<string | null>(localStorage.getItem('ourvoice_token'))
-  const [user, setUser] = useState<User | null>(() => {
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem('ourvoice_token'))
+  const [user, setUser] = useState<AuthUser | null>(() => {
     const stored = localStorage.getItem('ourvoice_user')
-    return stored ? JSON.parse(stored) : null
+    if (!stored) return null
+    try {
+      const parsed = JSON.parse(stored) as AuthUser
+      // Discard stale sessions from the old email/password auth (no phone field)
+      if (!parsed.phone) {
+        localStorage.removeItem('ourvoice_user')
+        localStorage.removeItem('ourvoice_token')
+        return null
+      }
+      return parsed
+    } catch {
+      return null
+    }
   })
-  const [isRegisterMode, setIsRegisterMode] = useState(true)
-  const [name, setName] = useState('')
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
+  // Keep a ref so async callbacks always read the latest token
+  const tokenRef = useRef<string | null>(token)
+  const [phone, setPhone] = useState('+421')
+  const [otpCode, setOtpCode] = useState('')
+  const [otpSent, setOtpSent] = useState(false)
   const [authError, setAuthError] = useState('')
   const [isAuthLoading, setIsAuthLoading] = useState(false)
   const [globalError, setGlobalError] = useState('')
+  const [lang, setLang] = useState<Lang>(
+    () => (localStorage.getItem('ourvoice_lang') as Lang) || 'sk'
+  )
+  const t = translations[lang]
+
+  function switchLang(l: Lang) {
+    setLang(l)
+    localStorage.setItem('ourvoice_lang', l)
+  }
 
   const sortedLaws = useMemo(() => {
     return [...laws].sort((a, b) => {
@@ -113,13 +137,19 @@ function App() {
     })
   }, [laws])
 
+  // Keep tokenRef in sync so async vote handlers always use the latest token
+  useEffect(() => {
+    tokenRef.current = token
+  }, [token])
+
   async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const url = `${API_BASE}${path}`
+    const accessToken = tokenRef.current
     const response = await fetch(url, {
       ...options,
       headers: {
         'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         ...(options?.headers ?? {}),
       },
     })
@@ -156,28 +186,60 @@ function App() {
     void loadLaws()
   }, [])
 
-  async function handleAuthSubmit(event: FormEvent) {
+  async function handlePhoneSubmit(event: FormEvent) {
+    event.preventDefault()
+    setAuthError('')
+    setIsAuthLoading(true)
+
+    const normalized = phone.startsWith('+421') ? phone : `+421${phone.replace(/\D/g, '')}`
+
+    if (!/^\+421[0-9]{9}$/.test(normalized)) {
+      setAuthError('Enter a valid Slovak number: +421 followed by 9 digits.')
+      setIsAuthLoading(false)
+      return
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/auth/otp/request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: normalized }),
+      })
+      const payload = await res.json() as { message?: string }
+      if (!res.ok) throw new Error(payload.message || 'Failed to send code.')
+      setPhone(normalized)
+      setOtpSent(true)
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Failed to send verification code.')
+    } finally {
+      setIsAuthLoading(false)
+    }
+  }
+
+  async function handleOtpSubmit(event: FormEvent) {
     event.preventDefault()
     setAuthError('')
     setIsAuthLoading(true)
 
     try {
-      const path = isRegisterMode ? '/auth/register' : '/auth/login'
-      const body = isRegisterMode ? { name, email, password } : { email, password }
-      const data = await request<{ token: string; user: User }>(path, {
+      const res = await fetch(`${API_BASE}/auth/otp/verify`, {
         method: 'POST',
-        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone, code: otpCode.trim() }),
       })
+      const data = await res.json() as { token?: string; user?: AuthUser; message?: string }
+      if (!res.ok) throw new Error(data.message || 'Invalid code.')
 
-      setToken(data.token)
-      setUser(data.user)
-      localStorage.setItem('ourvoice_token', data.token)
+      setToken(data.token!)
+      setUser(data.user!)
+      tokenRef.current = data.token!
+      localStorage.setItem('ourvoice_token', data.token!)
       localStorage.setItem('ourvoice_user', JSON.stringify(data.user))
-      setPassword('')
-      setName('')
-      setEmail('')
-    } catch (error) {
-      setAuthError(error instanceof Error ? error.message : 'Authentication failed.')
+      setOtpCode('')
+      setOtpSent(false)
+      setPhone('+421')
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Invalid verification code.')
     } finally {
       setIsAuthLoading(false)
     }
@@ -186,6 +248,7 @@ function App() {
   function signOut() {
     setToken(null)
     setUser(null)
+    tokenRef.current = null
     localStorage.removeItem('ourvoice_token')
     localStorage.removeItem('ourvoice_user')
   }
@@ -219,79 +282,118 @@ function App() {
       <header className="topbar">
         <div>
           <h1>OurVoice</h1>
-          <p className="subtitle">Compare how government voted with what citizens think.</p>
+          <p className="subtitle">{t.subtitle}</p>
         </div>
-        <div className="auth-state">
-          {user ? (
-            <>
-              <span>Signed in as {user.name}</span>
-              <button type="button" onClick={signOut}>
-                Sign out
-              </button>
-            </>
-          ) : (
-            <span>Sign in to vote</span>
-          )}
+        <div className="topbar-right">
+          <div className="lang-switcher">
+            <button
+              type="button"
+              className={`lang-btn${lang === 'sk' ? ' lang-btn-active' : ''}`}
+              onClick={() => switchLang('sk')}
+            >
+              SK
+            </button>
+            <button
+              type="button"
+              className={`lang-btn${lang === 'en' ? ' lang-btn-active' : ''}`}
+              onClick={() => switchLang('en')}
+            >
+              EN
+            </button>
+          </div>
+          <div className="auth-state">
+            {user ? (
+              <>
+                <span>+421&thinsp;·····{user.phone?.slice(-4) ?? '····'}</span>
+                <button type="button" onClick={signOut}>
+                  {t.signOut}
+                </button>
+              </>
+            ) : (
+              <span>{t.signInToVote}</span>
+            )}
+          </div>
         </div>
       </header>
 
       <section className="auth-panel">
         {!user && (
-          <form className="auth-form" onSubmit={handleAuthSubmit}>
-            <h2>{isRegisterMode ? 'Create account' : 'Sign in'}</h2>
-            {isRegisterMode && (
-              <label>
-                Name
-                <input
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  required
-                  minLength={2}
-                />
-              </label>
+          <form
+            className="auth-form"
+            onSubmit={otpSent ? handleOtpSubmit : handlePhoneSubmit}
+          >
+            <h2>{t.signIn}</h2>
+
+            {!otpSent ? (
+              <>
+                <label>
+                  {t.phoneNumber}
+                  <div className="phone-input-row">
+                    <span className="phone-prefix">+421</span>
+                    <input
+                      value={phone.replace(/^\+421/, '')}
+                      onChange={(e) =>
+                        setPhone(`+421${e.target.value.replace(/\D/g, '').slice(0, 9)}`)
+                      }
+                      type="tel"
+                      inputMode="numeric"
+                      placeholder={t.phoneDigits}
+                      autoComplete="tel"
+                      required
+                    />
+                  </div>
+                </label>
+                <p className="helper-small">{t.phoneHint}</p>
+              </>
+            ) : (
+              <>
+                <p className="otp-prompt">
+                  {t.codeSentTo} <strong>{phone}</strong>.
+                </p>
+                <label>
+                  {t.verificationCode}
+                  <input
+                    value={otpCode}
+                    onChange={(e) =>
+                      setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))
+                    }
+                    type="text"
+                    inputMode="numeric"
+                    placeholder={t.sixDigitCode}
+                    autoComplete="one-time-code"
+                    required
+                  />
+                </label>
+                {import.meta.env.VITE_DEV === 'true' && (
+                  <p className="dev-hint">
+                    {t.devHintPre}<strong>456123</strong>{t.devHintPost}
+                  </p>
+                )}
+                <button
+                  className="ghost"
+                  type="button"
+                  onClick={() => {
+                    setOtpSent(false)
+                    setOtpCode('')
+                    setAuthError('')
+                  }}
+                >
+                  {t.changeNumber}
+                </button>
+              </>
             )}
-
-            <label>
-              Email
-              <input
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                type="email"
-                required
-              />
-            </label>
-
-            <label>
-              Password
-              <input
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                type="password"
-                required
-                minLength={6}
-              />
-            </label>
 
             {authError && <p className="error">{authError}</p>}
 
             <button disabled={isAuthLoading} type="submit">
-              {isAuthLoading ? 'Please wait...' : isRegisterMode ? 'Register' : 'Sign in'}
-            </button>
-
-            <button
-              className="ghost"
-              type="button"
-              onClick={() => setIsRegisterMode((current) => !current)}
-            >
-              {isRegisterMode ? 'Already have an account? Sign in' : 'Need an account? Register'}
+              {isAuthLoading ? t.pleaseWait : otpSent ? t.verifyCode : t.sendCode}
             </button>
           </form>
         )}
 
         <p className="helper">
-          Citizens can submit two types of feedback: <strong>support/oppose</strong> and
-          <strong> useful/useless</strong>. This helps policymakers compare formal vote results
-          with citizen sentiment.
+          {t.feedbackIntro} <strong>{t.feedbackSupport}</strong> {t.feedbackAnd}{' '}
+          <strong>{t.feedbackUsefulness}</strong>. {t.feedbackOutro}
         </p>
       </section>
 
@@ -300,19 +402,19 @@ function App() {
       <section className="laws-grid">
         {sortedLaws.map((law) => {
           const governmentChartData: SplitData[] = [
-            { label: 'For', value: law.governmentVote.for },
-            { label: 'Against', value: law.governmentVote.against },
-            { label: 'Abstain', value: law.governmentVote.abstain },
+            { label: t.for, value: law.governmentVote.for },
+            { label: t.against, value: law.governmentVote.against },
+            { label: t.abstain, value: law.governmentVote.abstain },
           ]
 
           const citizenSentimentData: SplitData[] = [
-            { label: 'Support', value: law.citizen.citizenVotes.support },
-            { label: 'Oppose', value: law.citizen.citizenVotes.oppose },
+            { label: t.support, value: law.citizen.citizenVotes.support },
+            { label: t.oppose, value: law.citizen.citizenVotes.oppose },
           ]
 
           const usefulnessData: SplitData[] = [
-            { label: 'Useful', value: law.citizen.usefulness.useful },
-            { label: 'Useless', value: law.citizen.usefulness.useless },
+            { label: t.useful, value: law.citizen.usefulness.useful },
+            { label: t.useless, value: law.citizen.usefulness.useless },
           ]
 
           return (
@@ -322,21 +424,23 @@ function App() {
                 <h3>{law.title}</h3>
                 <p className="law-summary-clamped">{law.summary}</p>
                 <button className="ghost" type="button" onClick={() => setSelectedLaw(law)}>
-                  Read full text
+                  {t.readFullText}
                 </button>
               </div>
               <div className="meta">
-                <span className={`status status-${law.status}`}>{law.status}</span>
+                <span className={`status status-${law.status}`}>
+                  {law.status === 'passed' ? t.statusPassed : law.status === 'rejected' ? t.statusRejected : t.statusInProgress}
+                </span>
                 <span>{law.category}</span>
                 {law.cpt && <span>ČPT: {law.cpt}</span>}
                 {law.documentsUrl && (
                   <a href={law.documentsUrl} target="_blank" rel="noreferrer">
-                    Documents
+                    {t.documents}
                   </a>
                 )}
                 {law.votingUrl && (
                   <a href={law.votingUrl} target="_blank" rel="noreferrer">
-                    Voting detail
+                    {t.votingDetail}
                   </a>
                 )}
               </div>
@@ -344,25 +448,25 @@ function App() {
 
             <div className="comparison">
               <section className="column">
-                <h4>Government</h4>
+                <h4>{t.government}</h4>
                 <p>
-                  Voted on: <strong>{formatDate(law.votedOn)}</strong>
+                  {t.votedOn} <strong>{formatDate(law.votedOn, lang)}</strong>
                 </p>
                 <div className="stat-row">
-                  <span>For</span>
+                  <span>{t.for}</span>
                   <strong>{law.governmentVote.for}</strong>
                 </div>
                 <div className="stat-row">
-                  <span>Against</span>
+                  <span>{t.against}</span>
                   <strong>{law.governmentVote.against}</strong>
                 </div>
                 <div className="stat-row">
-                  <span>Abstain</span>
+                  <span>{t.abstain}</span>
                   <strong>{law.governmentVote.abstain}</strong>
                 </div>
 
                 <SplitDonutChart
-                  title="Government vote split"
+                  title={t.govChartTitle}
                   data={governmentChartData}
                   colors={GOVERNMENT_CHART_COLORS}
                 />
@@ -371,65 +475,69 @@ function App() {
               </section>
 
               <section className="column citizen-column">
-                <h4>Citizens</h4>
+                <h4>{t.citizens}</h4>
                 <div className="stat-row">
-                  <span>Support</span>
+                  <span>{t.support}</span>
                   <strong>{law.citizen.citizenVotes.support}</strong>
                 </div>
                 <div className="stat-row">
-                  <span>Oppose</span>
+                  <span>{t.oppose}</span>
                   <strong>{law.citizen.citizenVotes.oppose}</strong>
                 </div>
                 <div className="stat-row">
-                  <span>Useful</span>
+                  <span>{t.useful}</span>
                   <strong>{law.citizen.usefulness.useful}</strong>
                 </div>
                 <div className="stat-row">
-                  <span>Useless</span>
+                  <span>{t.useless}</span>
                   <strong>{law.citizen.usefulness.useless}</strong>
                 </div>
+                <p className="civic-disclaimer">{t.civicDisclaimer}</p>
 
                 <div className="charts-grid">
                   <SplitDonutChart
-                    title="Citizen support split"
+                    title={t.citizenSupportChart}
                     data={citizenSentimentData}
                     colors={CITIZEN_CHART_COLORS}
                   />
                   <SplitDonutChart
-                    title="Citizen usefulness split"
+                    title={t.citizenUsefulnessChart}
                     data={usefulnessData}
                     colors={USEFULNESS_CHART_COLORS}
                   />
                 </div>
 
                 <div className="ai-explanation">
-                  <h5>AI explanation</h5>
-                  {law.aiExplanation ? (
-                    <p className="ai-text">{law.aiExplanation}</p>
+                  <h5>{t.aiExplanation}</h5>
+                  {(lang === 'sk' ? law.aiExplanationSk : law.aiExplanation) ? (
+                    <>
+                      <p className="ai-text">{lang === 'sk' ? law.aiExplanationSk : law.aiExplanation}</p>
+                      <p className="ai-disclaimer">{t.aiDisclaimer}</p>
+                    </>
                   ) : (
-                    <p className="ai-pending">Not available yet — generating a short summary.</p>
+                    <p className="ai-pending">{t.aiPending}</p>
                   )}
                 </div>
                 {user ? (
                   <div className="action-row">
                     <button type="button" onClick={() => submitCitizenVote(law.id, 'support')}>
-                      Support
+                      {t.support}
                     </button>
                     <button type="button" onClick={() => submitCitizenVote(law.id, 'oppose')}>
-                      Oppose
+                      {t.oppose}
                     </button>
                     <button type="button" onClick={() => submitUsefulnessVote(law.id, 'useful')}>
-                      Useful
+                      {t.useful}
                     </button>
                     <button
                       type="button"
                       onClick={() => submitUsefulnessVote(law.id, 'useless')}
                     >
-                      Useless
+                      {t.useless}
                     </button>
                   </div>
                 ) : (
-                  <p className="helper">Sign in to vote and rate usefulness.</p>
+                  <p className="helper">{t.signInToVoteHint}</p>
                 )}
               </section>
             </div>
@@ -451,16 +559,19 @@ function App() {
             <header className="law-modal-header">
               <h3>{selectedLaw.title}</h3>
               <button type="button" className="ghost" onClick={() => setSelectedLaw(null)}>
-                Close
+                {t.close}
               </button>
             </header>
             <p>{selectedLaw.summary}</p>
             <section className="modal-ai">
-              <h4>AI explanation</h4>
-              {selectedLaw.aiExplanation ? (
-                <p>{selectedLaw.aiExplanation}</p>
+              <h4>{t.aiExplanation}</h4>
+              {(lang === 'sk' ? selectedLaw.aiExplanationSk : selectedLaw.aiExplanation) ? (
+                <>
+                  <p>{lang === 'sk' ? selectedLaw.aiExplanationSk : selectedLaw.aiExplanation}</p>
+                  <p className="ai-disclaimer">{t.aiDisclaimer}</p>
+                </>
               ) : (
-                <p className="ai-pending">Explanation not available yet. It may take a moment.</p>
+                <p className="ai-pending">{t.aiPendingModal}</p>
               )}
             </section>
           </section>
