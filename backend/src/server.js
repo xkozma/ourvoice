@@ -138,11 +138,13 @@ async function upsertExplanation(lawId, entry) {
   }
 }
 
-const NRSR_VOTING_URL = 'https://www.nrsr.sk/web/default.aspx?SectionId=108'
+const VOTING_URL = process.env.VOTING_URL
+if (!VOTING_URL) throw new Error('VOTING_URL env var must be set')
+const VOTING_BASE_URL = (() => { try { const u = new URL(VOTING_URL); return `${u.protocol}//${u.host}` } catch { throw new Error('VOTING_URL is not a valid URL') } })()
 const NRSR_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
   Accept: 'text/html,application/xhtml+xml,application/xml,*/*',
-  Referer: 'https://www.nrsr.sk/web/',
+  Referer: `${VOTING_BASE_URL}/web/`,
 }
 
 function stripHtml(text) {
@@ -202,7 +204,7 @@ function makeAbsoluteNrsrUrl(href) {
   const value = String(href || '').trim()
   if (!value) return null
   try {
-    return new URL(value, 'https://www.nrsr.sk').toString()
+    return new URL(value, VOTING_BASE_URL).toString()
   } catch {
     return null
   }
@@ -298,7 +300,7 @@ function mapBillToLaw(bill) {
       abstain: 0,
     },
     resultNote: summary,
-    sourceUrl: bill.sourceUrl || NRSR_VOTING_URL,
+    sourceUrl: bill.sourceUrl || VOTING_URL,
     votingUrl: bill.votingUrl || null,
     cpt: bill.billNumber || null,
     documentsUrl: bill.documentsUrl || null,
@@ -307,7 +309,7 @@ function mapBillToLaw(bill) {
 
 async function loadNRSRLaws() {
   try {
-    const response = await fetch(NRSR_VOTING_URL, {
+    const response = await fetch(VOTING_URL, {
       headers: NRSR_HEADERS,
     })
 
@@ -351,11 +353,12 @@ async function loadNRSRLaws() {
         billNumber: billId,
         title: titleText,
         description: titleText,
-        sourceUrl: NRSR_VOTING_URL,
+        sourceUrl: VOTING_URL,
         votingUrl: makeAbsoluteNrsrUrl(voteHref),
         documentsUrl:
           makeAbsoluteNrsrUrl(cptHref) ||
-          `https://www.nrsr.sk/web/?SectionId=91&CisloTlace=${encodeURIComponent(String(billId))}`,
+          `${VOTING_BASE_URL}/web/?SectionId=91&CisloTlace=${encodeURIComponent(String(billId))}`,
+
         governmentVote: { for: 0, against: 0, abstain: 0 },
         status: 'in-progress',
         votedOn: null,
@@ -450,7 +453,7 @@ async function loadActiveLaws() {
           })(),
           governmentVote: raw.governmentVote || raw.government_vote || { for: 0, against: 0, abstain: 0 },
           resultNote: raw.resultNote || row.summary || null,
-          sourceUrl: row.source_url || raw.sourceUrl || NRSR_VOTING_URL,
+          sourceUrl: row.source_url || raw.sourceUrl || VOTING_URL,
           votingUrl: raw.votingUrl || row.voting_url || null,
           cpt: row.cpt || raw.cpt || null,
           documentsUrl: row.documents_url || raw.documentsUrl || null,
@@ -468,7 +471,7 @@ async function loadActiveLaws() {
   const cached = readLawsCache()
 
   try {
-    const res = await fetch(NRSR_VOTING_URL, { headers: NRSR_HEADERS })
+    const res = await fetch(VOTING_URL, { headers: NRSR_HEADERS })
       if (res.ok) {
       const html = await res.text()
       // Do not rely on local cache files; parse live page and upsert to Supabase
