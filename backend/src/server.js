@@ -928,6 +928,8 @@ app.post('/api/auth/otp/request', async (req, res) => {
       return res.status(429).json({ message: 'Please wait 60 seconds before requesting another code.' })
     }
 
+    const lang = String(req.body.lang || 'sk').trim() === 'en' ? 'en' : 'sk'
+
     const otp = String(randomInt(0, 1_000_000)).padStart(6, '0')
     const hash = createHash('sha256').update(`${phone}:${otp}`).digest('hex')
     otpStore.set(phone, { hash, expiresAt: Date.now() + 5 * 60_000, sentAt: Date.now() })
@@ -936,9 +938,13 @@ app.post('/api/auth/otp/request', async (req, res) => {
       console.log(`[DEV] OTP for ${phone}: ${otp}`)
     }
 
+    const smsBody = lang === 'en'
+      ? `Your ZakonyLudsky verification code: ${otp}. Valid for 5 minutes.`
+      : `Vas overovaci kod pre ZakonyLudsky: ${otp}. Platny 5 minut.`
+
     try {
       await getTwilioClient().messages.create({
-        body: `Your OurVoice verification code: ${otp}. Valid for 5 minutes.`,
+        body: smsBody,
         from: TWILIO_FROM,
         to: phone,
       })

@@ -203,7 +203,7 @@ function App() {
       const res = await fetch(`${API_BASE}/auth/otp/request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone: normalized }),
+        body: JSON.stringify({ phone: normalized, lang }),
       })
       const payload = await res.json() as { message?: string }
       if (!res.ok) throw new Error(payload.message || 'Failed to send code.')
@@ -281,7 +281,7 @@ function App() {
     <main className="page">
       <header className="topbar">
         <div>
-          <h1>OurVoice</h1>
+          <h1>{lang === 'sk' ? 'ZakonyLudsky' : 'OurVoice'}</h1>
           <p className="subtitle">{t.subtitle}</p>
         </div>
         <div className="topbar-right">
