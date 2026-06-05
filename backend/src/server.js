@@ -928,16 +928,21 @@ app.post('/api/auth/otp/request', async (req, res) => {
     otpStore.set(phone, { hash, expiresAt: Date.now() + 5 * 60_000, sentAt: Date.now() })
 
     if (DEV) {
-      // In DEV mode skip Twilio — use the bypass code 456123 or the logged OTP below
       console.log(`[DEV] OTP for ${phone}: ${otp}`)
-      return res.json({ ok: true })
     }
 
-    await getTwilioClient().messages.create({
-      body: `Your OurVoice verification code: ${otp}. Valid for 5 minutes.`,
-      from: TWILIO_FROM,
-      to: phone,
-    })
+    try {
+      await getTwilioClient().messages.create({
+        body: `Your OurVoice verification code: ${otp}. Valid for 5 minutes.`,
+        from: TWILIO_FROM,
+        to: phone,
+      })
+    } catch (twilioErr) {
+      if (!DEV) throw twilioErr
+      // In DEV: swallow Twilio errors (trial accounts can't SMS unverified numbers).
+      // Use the code logged above or the bypass code 456123.
+      console.warn(`[DEV] Twilio send failed (${twilioErr.message}) — use logged OTP or bypass code 456123.`)
+    }
 
     return res.json({ ok: true })
   } catch (err) {
